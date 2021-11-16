@@ -1,0 +1,2555 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>local script</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body onload = "startGame()">
+<div>
+	<p style="font-size:30px;">keys: (a, s), (q, w), (p), (u), ( j, k), (n, m), (1, 2, 3, 4, 5, 6, 7, 9, 0), mouseDrag</p>
+	<p id="fps" style="font-size:20px;">fps: </p>
+	<p>
+		<canvas id="myCanvas" width="600" height="480" style="border:2 px solid black;"></canvas>
+	</p>
+	<p id="coords">cursor world coords (x, y)</p>
+	<p>press (a,s) to rotate triangle obstacle</p>
+	<p>press (q,w) to decrement/increment ActiveListDebuggerIndex</p>
+	<p>press p to toggle game pause; still allows use of debugger but stops calculating new visibility polygon every frame</p>
+	<p>press u to write every nontrivial intersection result to console</p>
+	<p>press y to log VL_network (after rendering) to console in JSON format</p>
+	<p>press lowercase (j,k) to decrement/increment interesection debugger index</p>
+	<p>press lowercase (J,K) to jump to prev/next nontrivial interesection debugger index</p>
+	<p>press (n,m) to decrement/increment interesection debugger by large number</p>
+	<p>press (1,2,3,4) to scroll camera interesection debugger by large number</p>
+	<p>press (-,=) to zoom camera out/in</p>
+	<p>press 7 to output current cameraRect's position in world coords</p>
+	<p>press 9 to zoom camera into problematic area</p>
+	<p>press 0 to reset camera</p>
+	<p>drag mouse to zoom into region</p>
+</div>
+<script>
+//throw 'TODO make algorithm more robust so that it doesn\'t crash upon missing any single edge';
+const CANVAS_WIDTH = 600;
+const CANVAS_HEIGHT = 480;
+var canvas = undefined;
+var ctx = undefined;
+var xMouse = CANVAS_WIDTH/2;	// mouse coords relative to topleft of canvas
+var yMouse = CANVAS_HEIGHT/2;
+var xCanvas = undefined;
+var yCanvas = undefined;
+const FPS = 60;
+var frame = 0;
+const UNIVERSAL_LINE_WIDTH = 3;
+
+// returns an Image(), possibly not yet loaded
+function load_image(filepath){
+	var img = document.createElement("img");
+	img.src = filepath;
+	img.onload = function(){
+		img.isLoaded = true;
+	};
+	img.isLoaded = false;	// custom member
+	return img;
+}
+
+// Blit an image to the canvas
+// alpha is a float in the range [0, 1]
+function apply_image(img, x, y, alpha = 1.0){
+	if (img.isLoaded || img instanceof HTMLCanvasElement){
+		if (alpha == 1.0){
+			ctx.drawImage(img, x, y);
+		}else{
+			let cv = document.createElement("canvas");
+			cv.width = img.width;
+			cv.height = img.height;
+			
+			let cx = cv.getContext("2d");
+			cx.globalAlpha = alpha;
+			cx.drawImage(img, 0, 0);
+			ctx.drawImage(cv, x, y);	// must render to a 2nd canvas and then render the 2nd canvas to the screen, since globalAlpha is the only way to use transparency
+		}
+	}else{
+		throw "cannot draw non-loaded image!";
+	}
+}
+
+// constructor
+function Rect(x, y, w, h)
+{
+	this.x = x;
+	this.y = y;
+	this.w = w;
+	this.h = h;
+}
+
+Rect.prototype.toString = function(nTabs = 0)
+{
+	return 'rect=['.concat(this.x, ', ', this.y, ', ', this.w, ', ', this.h, ']');
+}
+
+Rect.prototype.render = function(strokeColorStr, fillColorStr)
+{
+	if (strokeColorStr == undefined && fillColorStr == undefined){
+		throw "invisible fill and stroke rectangle";
+	}
+	if (strokeColorStr){
+		const RECT_BORDER_WIDTH = 0.6;
+		ctx.lineWidth = RECT_BORDER_WIDTH;
+		ctx.strokeStyle = strokeColorStr;
+		ctx.strokeRect(this.x, this.y, this.w, this.h);
+		ctx.lineWidth = UNIVERSAL_LINE_WIDTH;
+	}
+	if (fillColorStr){
+		ctx.fillStyle = fillColorStr;
+		ctx.fillRect(this.x, this.y, this.w, this.h);
+	}
+}
+
+let dstCameraRect = new Rect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);	// current camera rect in world coords
+	// camera transform is performed within rendering functions of {vec2, LineSeg, Polygon} classes, with high-level classes unaware of camera transform
+let cameraRect = new Rect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);	// limit of camera rect after slowly interpolating
+
+// constructor
+function vec2(x, y){
+	this.x = x;
+	this.y = y;
+}
+
+vec2.prototype.add = function(v2){
+	return new vec2(this.x + v2.x, this.y + v2.y);
+}
+
+vec2.prototype.subtract = function(v2){
+	return new vec2(this.x - v2.x, this.y - v2.y);
+}
+
+vec2.prototype.mult = function(factor){
+	return new vec2(this.x*factor, this.y*factor);
+}
+
+// dot product, returns float
+vec2.prototype.dot = function(v2){
+	return this.x*v2.x + this.y*v2.y;
+}
+
+// length squared
+vec2.prototype.len_sq = function(){
+	return this.dot(this);
+}
+
+vec2.prototype.len = function(){
+	return Math.sqrt(this.len_sq());
+}
+
+// return new vector
+vec2.prototype.normalize = function(){
+	return this.mult(1/this.len());	// divide by zero error thrown automatically; divide by veryLarge OR verySmall float case isn't a problem due to javascript's floating point exponential notation
+}
+
+vec2.prototype.toString = function(factor){
+	return '('.concat(this.x, ', ', this.y, ')');
+}
+
+// convert world coords to coords on screen
+vec2.prototype.world_to_camera_coords = function(cameraRect)
+{
+	// pixel at topLeft corner of cameraRect is mapped to (0, 0) in canvas element
+	// pixel at bottomRight corner of cameraRect is mapped to (CANVAS_WIDTH, CANVAS_HEIGHT) in canvas element
+	return new vec2((this.x-cameraRect.x)/cameraRect.w*CANVAS_WIDTH, (this.y-cameraRect.y)/cameraRect.h*CANVAS_HEIGHT);
+}
+
+vec2.prototype.world_to_camera_direc = function(cameraRect){
+	// scale length only; don't translate
+	return new vec2(this.x/cameraRect.w*CANVAS_WIDTH, this.y/cameraRect.h*CANVAS_HEIGHT);
+}
+
+vec2.prototype.camera_to_world_coords = function(cameraRect)
+{
+	// pixel at topLeft corner of canvas element is mapped to cameraTopLeft position in world
+	// pixel at bottomRight corner of canvas element is mapped to cameraBottomRight position in world
+	return new vec2(this.x/CANVAS_WIDTH*cameraRect.w + cameraRect.x, this.y/CANVAS_HEIGHT*cameraRect.h + cameraRect.y);
+}
+
+vec2.prototype.camera_to_world_direc = function(cameraRect)
+{
+	// scale length only; don't translate
+	return new vec2(this.x/CANVAS_WIDTH*cameraRect.w, this.y/CANVAS_HEIGHT*cameraRect.h);
+}
+
+// args are vec2 objects
+// returns boolean
+const MIN_SIN = 1e-9;
+// will throw error in vec2.normalize if zero vector is one of the args
+vec2.is_parallel = function(v1, v2){
+	let v1n = v1.normalize();
+	let v2n = v2.normalize();
+	return Math.abs( v1n.x*v2n.y - v1n.y*v2n.x ) < MIN_SIN;	// normalize first to minimize influence of vector length on parallel result
+//	return Math.abs(v1.x*v2.y - v2.x*v1.y) < MIN_VEC_LEN;
+	// ERROR PREVIOUSLY HERE: crossProd(v1, v2) == zero if parallel vectors OR if one (or both) vectors have very small length
+}
+
+const MIN_VEC_LEN = 1e-9;
+vec2.is_same_loc = function(v1, v2)
+{
+	// hopefully more robust against floating point error than [(v1-v2).len_sq() == 0]
+	return v1.subtract(v2).len_sq() < MIN_VEC_LEN*MIN_VEC_LEN;
+}
+
+vec2.prototype.render_solid = function(colorStr, radius)
+{
+	ctx.fillStyle = colorStr;
+	ctx.beginPath();
+	let vTransformed = this.world_to_camera_coords(cameraRect);
+	ctx.arc(vTransformed.x, vTransformed.y, radius, 0, 2*Math.PI);
+	ctx.fill();
+}
+
+vec2.prototype.render_ring = function(colorStr, radius)
+{
+	ctx.strokeStyle = colorStr;
+	ctx.beginPath();
+	let vTransformed = this.world_to_camera_coords(cameraRect);
+	ctx.arc(vTransformed.x, vTransformed.y, radius, 0, 2*Math.PI);
+	ctx.stroke();
+}
+
+// render text at arg world coords
+vec2.prototype.render_text = function(textStr, colorStr)
+{
+	ctx.fillStyle = colorStr;
+	let vTransformed = this.world_to_camera_coords(cameraRect);
+	ctx.fillText(textStr, vTransformed.x, vTransformed.y);
+}
+
+// constructor
+// args are vec2 objects or Vertex objects
+function LineSeg(r1, r2, debugId = undefined){
+	this.r1 = r1;
+	this.r2 = r2;
+	this.debugId = debugId;
+}
+
+// call with one positive vertex radius arg to render same-radius circle around each endpoint
+// call with 2nd positive vertex radius to render r1 and r2 with different ring radii
+LineSeg.prototype.render = function(colorStr = '#000000FF', vertexRadius1 = undefined, vertexRadius2 = undefined){
+	ctx.strokeStyle = colorStr;
+	ctx.beginPath();
+	let v1Transformed = this.r1.world_to_camera_coords(cameraRect);
+	let v2Transformed = this.r2.world_to_camera_coords(cameraRect);
+	ctx.moveTo(v1Transformed.x, v1Transformed.y);
+	ctx.lineTo(v2Transformed.x, v2Transformed.y);
+	ctx.stroke();
+	
+	if (vertexRadius1 != undefined)
+	{
+		this.r1.render_ring(colorStr, vertexRadius1);
+		if (vertexRadius2 != undefined){
+			this.r2.render_ring(colorStr, vertexRadius2);
+		}else{
+			this.r2.render_ring(colorStr, vertexRadius1);
+		}
+	}
+};
+
+function lerp(a, b, x)
+{
+	return a*(1-x) + b*x;
+}
+
+// compute pseudorandom random unit vector seeded by seedStr, oscillating in angle via two sinusoids, based on current frame
+// returns vec2
+function get_legend_offset(seedStr)
+{
+	const LEGEND_OFFSET_DIST = 38;
+	const MIN_OMEGA = 0.004;
+	const MAX_OMEGA = 0.006;
+	let [r1, r2, r3, r4] = rng(seedStr, 4);
+	let [w1, w2, phi1, phi2] = [lerp(MIN_OMEGA, MAX_OMEGA, r1), lerp(MIN_OMEGA, MAX_OMEGA, r2), lerp(0, 2*Math.PI, r3), lerp(0, 2*Math.PI, r4)];
+	let theta = lerp(0, 2*Math.PI, 0.5*(Math.sin(w1*frame + phi1) + Math.sin(w2*frame + phi2)) + 1);
+	return new vec2(Math.cos(theta), Math.sin(theta)).mult(LEGEND_OFFSET_DIST);
+}
+
+// render text offset by offsetVec (in onscreen pixel coords)
+// and render thin lineSeg connecting *this* vector and text location
+vec2.prototype.render_offset_legend_text = function(textStr, colorStr = '#000000FF', offsetVec = undefined)
+{
+	if (offsetVec == undefined){
+		offsetVec = new vec2(0, 0);
+	}
+	let v2 = this.add(offsetVec.camera_to_world_direc(cameraRect));	// billboard that is always a certain pixel offset away onscreen
+	v2.render_text(textStr, colorStr);
+
+	const TEXT_LEGEND_LINE_WIDTH = 0.9;
+	ctx.lineWidth = TEXT_LEGEND_LINE_WIDTH;
+	new LineSeg(this, v2).render(colorStr);
+	ctx.lineWidth = UNIVERSAL_LINE_WIDTH;
+};
+
+// render debugId and midpoint ONLY; do not render endpoints nor lineSeg
+LineSeg.prototype.render_debug_id = function(colorStr = '#000000FF')
+{
+	let mid = this.r1.add(this.r2).mult(0.5);
+	const lineDirec = this.r2.subtract(this.r1);
+	if (vec2.is_same_loc(lineDirec, new vec2(0, 0)))	// if lineSeg is single point, then no normal line segment jutting out
+	{
+		mid.render_text(this.debugId, colorStr);
+	}
+	else
+	{
+		const MIDPOINT_RADIUS = 3.5;
+		mid.render_solid(colorStr, MIDPOINT_RADIUS);
+		
+//    	// render text offset normal to line direction, preferentially rightward
+		// const TEXT_NORMAL_OFFSET_DIST = 38;	// dist (in camera pixels) between debugId text and actual vec2 location
+		// let normal = lineDirec.mult(TEXT_NORMAL_OFFSET_DIST/lineDirec.len() * cameraRect.w/CANVAS_WIDTH);
+		// normal = new vec2(normal.y, -normal.x);
+		// if (normal.x < 0)
+		// {
+			// normal.x *= -1;
+			// normal.y *= -1;
+		// }
+		
+		mid.render_offset_legend_text(this.debugId, colorStr, get_legend_offset(this.debugId.toString()));
+	}
+}
+
+// render positive&negative [sawtooth wave with arg num periods], similar to sin wave, along *this* LineSeg to distinguish from other collinear line segs
+// amplitude radio is amplitude/lineSegLength
+LineSeg.prototype.render_saw = function(colorStr = '#000000FF', nPeriods = 10, amplitudeRatio = 1/35.4, vertexRadius1 = undefined, vertexRadius2 = undefined){
+	const lineDirec = this.r2.subtract(this.r1);
+	if (amplitudeRatio == undefined){
+		amplitudeRatio = lineDirec.len()/35.4;
+	}
+	normal = lineDirec.mult(amplitudeRatio);	// euclidean length == amplitude
+	normal = new vec2(normal.y, -normal.x);
+	
+	const SAW_START_PROGRESS = 0.1;	// begin sawtooth at a distance from vertex, to display correct lineseg angle near vertex
+	let progressArr = new Array(2*nPeriods).fill(0).map( (val, index) => (index+0.5)/(2*nPeriods)*(1-2*SAW_START_PROGRESS)+SAW_START_PROGRESS );	// linearly interpolate [evenly-distributed progress] between (SAW_START_PROGRESS) and (1-SAW_START_PROGRESS)
+	
+	ctx.strokeStyle = colorStr;
+	ctx.beginPath();
+	let v1Transformed = this.r1.world_to_camera_coords(cameraRect);
+	ctx.moveTo(v1Transformed.x, v1Transformed.y);
+	let vSawStartTransformed = lineDirec.mult(SAW_START_PROGRESS).add(this.r1).world_to_camera_coords(cameraRect);
+	ctx.lineTo(vSawStartTransformed.x, vSawStartTransformed.y);
+	for(let i = 0; i < progressArr.length; ++i)
+	{
+		let vTransformed = lineDirec.mult(progressArr[i]).add(this.r1).add(normal.mult(i % 2 == 0 ? 1 : -1)).world_to_camera_coords(cameraRect);
+		ctx.lineTo(vTransformed.x, vTransformed.y);
+	}
+	let vSawEndTransformed = lineDirec.mult(1-SAW_START_PROGRESS).add(this.r1).world_to_camera_coords(cameraRect);
+	ctx.lineTo(vSawEndTransformed.x, vSawEndTransformed.y);
+	let v2Transformed = this.r2.world_to_camera_coords(cameraRect);
+	ctx.lineTo(v2Transformed.x, v2Transformed.y);
+	ctx.stroke();
+	
+	if (vertexRadius1 != undefined)
+	{
+		this.r1.render_ring(colorStr, vertexRadius1);
+		if (vertexRadius2 != undefined){
+			this.r2.render_ring(colorStr, vertexRadius2);
+		}else{
+			this.r2.render_ring(colorStr, vertexRadius1);
+		}
+	}
+}
+
+LineSeg.prototype.toString = function()
+{
+	return '( '.concat(this.r1.toString(), ' to ', this.r2.toString(), '; id=', (this.debugId ?? ''), ' )');
+}
+
+
+// constructor for Ray-LineSeg intersection result
+// NOT related to intersect result debugging class
+function RLIntersectResult(isIntersecting, tRay){
+	this.isIntersecting = isIntersecting;  // boolean
+	this.tRay = tRay;  // tRay == 0 means intersect at ray origin, and tRay == 1 means intersect at rayOrigin+rayDirec; tRay == undefined if not intersecting
+}
+
+
+// returns RLIntersectResult object
+// returns [isIntersecting == true && float tRay] if [>=1 point in lineSeg] strictly in front of ray
+// return [isIntersecting == false] if no points in lineSeg strictly in front of ray
+// throws error if invalid geometry
+function get_ray_lineSeg_intersection(rayOrigin, rayDirec, lineSeg){
+	if (vec2.is_same_loc(rayOrigin, rayDirec)){
+		throw "cannot create visibility polygon when ray has zero direction";
+	}
+	
+	let lineSegDirec = lineSeg.r2.subtract(lineSeg.r1);
+	if (vec2.is_same_loc(lineSegDirec, new vec2(0, 0)))
+	{
+		// case 0: line segment of zero length
+		if (vec2.is_parallel(rayDirec, lineSeg.r1.subtract(rayOrigin)))
+		{
+			// case 0a: point contained in ray
+			return new RLIntersectResult(true, lineSeg.r1.subtract(rayOrigin).dot(rayDirec)/rayDirec.dot(rayDirec));
+		}
+		else
+		{
+			// case 0b: point not contained in ray
+			return new RLIntersectResult(false);
+		}
+	}
+	
+	if (vec2.is_parallel(rayDirec, lineSegDirec)){
+		// case 1: ray and lineSeg are parallel (or line segment is of length zero, which is handled the same way as case 1)
+		
+		if (!vec2.is_parallel(lineSeg.r1.subtract(rayOrigin), rayDirec))	// check for coinciding
+		{
+			// case 1a: ray and lineSeg are parallel but not coinciding
+			return new RLIntersectResult(false);
+		}
+		else
+		{
+			// case 1b: ray and lineSeg are coinciding lines
+			let dp1 = lineSeg.r1.subtract(rayOrigin).dot(rayDirec);
+			let dp2 = lineSeg.r2.subtract(rayOrigin).dot(rayDirec);
+			
+			if (dp1+dp2 > 0 && dp1*dp2 > 0)
+			{ 
+				// case 1bA: line segment completely in front of ray
+				// return point closer to ray origin
+				if (dp1 <= dp2){
+					return new RLIntersectResult(true, lineSeg.r1.subtract(rayOrigin).dot(rayDirec)/rayDirec.dot(rayDirec));	// projection
+				}
+				return new RLIntersectResult(true, lineSeg.r2.subtract(rayOrigin).dot(rayDirec)/rayDirec.dot(rayDirec)); // projection
+			}
+			else if(dp1+dp2 < 0 && dp1*dp2 > 0)
+			{
+				// case 1bB: line segment completely behind ray
+				return new RLIntersectResult(false);
+			}
+			// case 1bC: lineSeg (including end vertices) contains ray origin
+			throw "line segment cannot contain ray origin";
+		}
+	}
+	else
+	{
+		// case 2: line segments not parallel
+		// All non-parallel lines intersect exactly once; find unique params (tL, tR) such that L0 + tL*(L1-L0) = R0 + tR*(R1-R0) where L is lineSeg and R is ray
+		// use Cramer's rule to find (tLineSeg, tRay)
+		let L0 = lineSeg.r1;
+		let R0 = rayOrigin;
+		let vL = lineSegDirec;
+		let vR = rayDirec;
+		const det = vR.x*vL.y - vL.x*vR.y;	// don't worry about underflow; floating point uses many significant figures
+		let tLR = new vec2(vR.x, vL.x).mult(R0.y-L0.y).subtract(new vec2(vR.y, vL.y).mult(R0.x-L0.x)).mult(1/det);
+		let tL = tLR.x;
+		let tR = tLR.y;
+		
+		if (tL < 0.0 || tL > 1.0)
+		{
+			// case 2a: ray's line doesn't intersect line segment
+			return new RLIntersectResult(false);	
+		}
+		else
+		{
+			// case 2b: ray's line intersects line segment
+			
+			if (tR < 0.0){
+				// case 2bA: line segment behind ray
+				return new RLIntersectResult(false);	
+			}
+			
+			if (tR == 0.0){
+				// case 2bB: line segment intersects ray origin
+				throw "line segment cannot contain ray origin";
+			}
+			
+			// case 2bC: valid intersection in front of ray
+			return new RLIntersectResult(true, tR);
+		}
+	}
+}
+
+// return tRay for vertex that is already on the ray
+// throw error if vertex not on ray
+function get_ray_vertex_tRay(rayOrigin, rayDirec, vertex)
+{
+	if (vec2.is_same_loc(rayDirec, new vec2(0, 0))){
+		throw 'ray direction cannot be zero vector';
+	}
+
+	let dv = vertex.subtract(rayOrigin);	
+	if (!(vec2.is_parallel(rayDirec, dv))){
+		throw 'vertex must be on rayDirection line';
+	}
+	
+	// projection
+	return dv.dot(rayDirec)/rayDirec.dot(rayDirec);
+}
+
+// simple polygon of either counterclockwise or clockwise winding
+// arg vertices is array of vec2 objects
+function Polygon(vertices){
+	if (vertices.length < 3){
+		throw 'cannot have polygon with only '.concat(vertices.length, ' vertices; need at least 3');
+	}
+	this.vertices = vertices.slice();	// clone
+	
+	// render line segs only, not vertices nor debugIds
+	this.render = function(lineColorStr = undefined, fillColorStr = undefined){
+		if (lineColorStr == undefined && fillColorStr == undefined)
+		{
+			lineColorStr = '#FF0000FF';
+		}
+		
+		ctx.beginPath();
+		for(let i = 0; i < this.vertices.length+1; ++i){
+			let i1 = i % this.vertices.length;
+			let vTransformed = this.vertices[i1].world_to_camera_coords(cameraRect);
+			if (i == 0)
+			{
+				ctx.moveTo(vTransformed.x, vTransformed.y);
+			}
+			else
+			{
+				ctx.lineTo(vTransformed.x, vTransformed.y);
+			}
+		}
+		if (lineColorStr != undefined)
+		{
+			ctx.strokeStyle = lineColorStr;
+			ctx.stroke();
+		}
+		
+		if (fillColorStr != undefined){
+			ctx.fillStyle = fillColorStr;
+			ctx.fill();
+		}
+	}
+	
+	// return new rotated Poylgon; center is vec2
+	this.rotate = function(center, thetaRad){
+		return new Polygon(this.vertices.map(function(v){
+			let v1 = v.subtract(center);
+			let xR = v1.x*Math.cos(thetaRad) - v1.y*Math.sin(thetaRad);
+			let yR = v1.x*Math.sin(thetaRad) + v1.y*Math.cos(thetaRad);
+			return new vec2(xR, yR).add(center);
+		}));
+	}
+
+	// return new translated polygon
+	this.translate = function(offsetVec){
+		return new Polygon(this.vertices.map(v => v.add(offsetVec)));
+	}
+	
+	// render debugIds ONLY; do not render polygon vertices nor polygon lineSegs nor polygon fill
+	this.render_debug_ids = function(colorStr = '#DD00CCFF')
+	{
+		for(let i in this.vertices)
+		{
+			this.vertices[i].render_text(v.debugId, GREY);
+		}
+	}
+}
+
+// returns Polygon object
+function create_polygon_from_rect(rect){
+	return new Polygon([new vec2(rect.x, rect.y),
+						new vec2(rect.x+rect.w, rect.y),
+						new vec2(rect.x+rect.w, rect.y+rect.h),
+						new vec2(rect.x, rect.y+rect.h)]);
+}
+
+// constructor
+// v is vec2 object 
+// incidentLineSegs is unordered array of LineSeg objects incident on this Vertex
+function Vertex(v, incidentLineSegs = undefined, debugId = undefined){
+	vec2.call(this, v.x, v.y);
+	if (incidentLineSegs == undefined){
+		incidentLineSegs = [];
+	}
+	this.incidentLineSegs = incidentLineSegs;
+	this.debugId = debugId;
+}
+Vertex.prototype = Object.create(vec2.prototype);
+
+// returns the other endpoint vec2 of a lineSeg incident on *this* Vertex
+Vertex.prototype.other_endPoint = function(lineSeg){
+	if (this.incidentLineSegs.indexOf(lineSeg) == -1){
+		throw 'arg line segment is not incident on this Vertex';
+	}
+	
+	if (lineSeg.r1 == this)
+	{
+		return lineSeg.r2;
+	}
+	else if(lineSeg.r2 == this)
+	{
+		return lineSeg.r1;
+	}
+	throw 'neither of line segment\'s endpoints is this Vertex';
+}
+
+// transfer all incident edges of this Vertex to v
+// also sets incident edges' r1 or r2 (or both) to new Vertex
+Vertex.prototype.transfer_incident_edges_to = function(v)
+{
+	for(let i = 0; i < this.incidentLineSegs.length; ++i)
+	{
+		let Ls = this.incidentLineSegs[i];
+		let hasTransferred = false;
+		if (Ls.r1 == this)
+		{
+			Ls.r1 = v;
+			hasTransferred = true;
+		}
+		if(Ls.r2 == this)
+		{
+			Ls.r2 = v;
+			hasTransferred = true;
+		}
+		
+		if (!hasTransferred)
+		{
+			console.log('invalid connectivity:', this, '*this* vertex has incident line seg', Ls, 'but lineSeg does not have *this* endpoint');
+			throw 0;
+		}
+	}
+	
+	[].push.apply(v.incidentLineSegs, this.incidentLineSegs);
+	this.incidentLineSegs.splice(0);
+}
+
+// since console.log(Vertex) doesn't always display correct values
+Vertex.prototype.toString = function()
+{
+	return '(('.concat(this.x, ', ', this.y, '); id=', (this.debugId ?? ''), ')');
+}
+
+// only renders debugId text; does NOT render vertex itself
+Vertex.prototype.render_debug_id = function(colorStr)
+{
+	this.render_offset_legend_text(this.debugId, colorStr, get_legend_offset(this.debugId.toString()));
+}
+
+// constructor
+// stores tRay for one iteration
+// ONLY to be used as elements of activeList in sweep algorithm
+function LineSegCache(lineSeg, tRay){
+	this.lineSeg = lineSeg;
+	this.tRay = tRay;
+}
+
+// constructor
+// network of interconnected and !!![inter-referential]!!! Vertices and Line segments
+function Vertex_LineSeg_Network(){
+	this.vertices = [];	// array of Vertex objects
+	this.lineSegs = [];	// array of LineSeg objects
+	
+	// doesn't checks whether added vertices/lineSegs are duplicates (memory-wise)
+	this.add_network = function(newVertices, newLineSegs){
+		[].push.apply(this.vertices, newVertices);
+		[].push.apply(this.lineSegs, newLineSegs);
+	};
+	
+	// adds vertex to network if arg vertex is in same geometric location as another vertex already in network
+	// otherwise transfers incident edges to old vertex and doesn't add new vertex to network
+	// returns new vertex if added successfully; returns existing vertex if didn't add successfully
+	this.add_vertex_keep_unique = function(v)
+	{
+		for(let i in this.vertices){
+			if (vec2.is_same_loc(v, this.vertices[i])){
+				v.transfer_incident_edges_to(this.vertices[i]);
+				return this.vertices[i];
+			}
+		}
+		// otherwise different location from all other vertices
+		this.vertices.push(v);
+		return v;
+	};
+	
+	this.add_polygon = function(poly){
+		let polyVertices = [];	// array of Vertex objects
+		let polyLineSegs = [];	// polyLineSegs[i] is LineSeg that goes from polyVertices[i] to polyVertices[i+1], wrapping around to i=0
+		
+		// create Vertex and LineSeg objects
+		for(let j = 0; j < poly.vertices.length; ++j){
+			polyVertices[j] = new Vertex(poly.vertices[j], []);
+			polyLineSegs[j] = new LineSeg(undefined, undefined);
+		}
+		
+		// link Vertex and LineSeg objects to each other
+		for(let j = 0; j < poly.vertices.length; ++j){
+			polyVertices[j].incidentLineSegs.push(polyLineSegs[j]);
+			polyVertices[j].incidentLineSegs.push(polyLineSegs[(j-1+poly.vertices.length)%poly.vertices.length]);	// must add vertices.length, otherwise [(-1 % LEN) == -1]
+			
+			polyLineSegs[j].r1 = polyVertices[j];
+			polyLineSegs[j].r2 = polyVertices[(j+1)%poly.vertices.length];
+		}
+		this.add_network(polyVertices, polyLineSegs);
+	};
+	
+	// add [wall from r1 to r2] to network and connects Vertexes to LineSeg
+	// r1 and r2 are of type vec2 or of type Vertex
+	//   if type vec2, then creates new Vertexes to push to this.vertices; otherwise pushes arg Vertexes to this.vertices
+	// returns new LineSeg
+	this.add_wall = function(r1, r2, lineSegDebugId = undefined){
+		let v1 = r1 instanceof Vertex ? r1 : new Vertex(r1, []);	// actual Vertex added to VL_network.vertices is different object in memory than method args
+		let v2 = r2 instanceof Vertex ? r2 : new Vertex(r2, []);
+		let Ls = new LineSeg(v1, v2, lineSegDebugId);
+		v1.incidentLineSegs.push(Ls);	// if both endpoints are same endpoint in memory, then lineSeg is added to Vertex.incidentLineSegs twice
+		v2.incidentLineSegs.push(Ls);
+		this.add_network([v1, v2], [Ls]);
+		return Ls;
+	};
+	
+	// same as add_wall but only pushes new lineSeg to this.lineSegs; doesn't push arg Vertices to this.vertices
+	// assumes arg Vertexes are already in this.vertices (memory-wise)
+	// returns new LineSeg
+	this.add_wall_only = function(v1, v2, lineSegDebugId = undefined)
+	{
+		let Ls = new LineSeg(v1, v2, lineSegDebugId);
+		v1.incidentLineSegs.push(Ls);  // if both endspoints are same endpoint in memory, then lineSeg is added to Vertex.incidentLineSegs twice
+		v2.incidentLineSegs.push(Ls);
+		this.add_network([], [Ls]);
+		return Ls;
+	};
+	
+	// removes wall (but not endpoint Vertexes) from this.lineSegs
+	// also removes wall's endpoint attachments
+	this.delete_wall_only = function(lineSeg)
+	{
+		let i1 = lineSeg.r1.incidentLineSegs.indexOf(lineSeg);
+		if (i1 != -1)
+		{
+			lineSeg.r1.incidentLineSegs.splice(i1, 1);
+		}
+
+		let i2 = lineSeg.r2.incidentLineSegs.indexOf(lineSeg);
+		if (i2 != -1)
+		{
+			lineSeg.r2.incidentLineSegs.splice(i2, 1);
+		}
+
+		let index = this.lineSegs.indexOf(lineSeg);
+		if (index == -1)
+		{
+			throw 'cannot find lineSeg in this.lineSegs';
+		}
+		this.lineSegs.splice(index, 1);
+	};
+	
+	// only overwrites undefined debugIds
+	this.assign_debug_ids = function(){
+		for(let i = 0; i < this.vertices.length; ++i){
+			if (this.vertices[i].debugId == undefined){
+				this.vertices[i].debugId = i;
+			}
+		}
+		
+		for(let i = 0; i < this.lineSegs.length; ++i){
+			if (this.lineSegs[i].debugId == undefined){			
+				this.lineSegs[i].debugId = i;
+			}
+		}
+	};
+	
+	// verify that all LineSegs have Vertices whose incident edges include those LineSegs, and
+	//    also verify that all Vertices have lineSegs incident on those Vertices
+	// Do nothing if valid connectivity; throw error if invalid connectivity
+	// [lineSeg whose endpoints are same Vertex in memory]s are allowed
+	this.verify_connectivity = function(){
+		for(let i in this.lineSegs){
+			let Ls = this.lineSegs[i];
+			if (Ls.r1.incidentLineSegs.indexOf(Ls) == -1){
+				console.log('invalid connectivity: (', Ls, ') has endpoint (', Ls.r1, ') but (', Ls.r1, ') does NOT have incident LineSeg (', Ls, ')');
+				throw 0;
+			}
+			if (Ls.r2.incidentLineSegs.indexOf(Ls) == -1){
+				console.log('invalid connectivity: (', Ls, ') has endpoint (', Ls.r2, ') but (', Ls.r2, ') does NOT have incident LineSeg (', Ls, ')');
+				throw 0;
+			}
+		}
+		
+		for(let i in this.vertices){
+			let v = this.vertices[i];
+			for(let j in v.incidentLineSegs){
+				let Ls = v.incidentLineSegs[j];
+				if (Ls.r1 != v && Ls.r2 != v){
+					console.log('invalid connectivity: ', v, ' has incident LineSeg ', Ls, ' but ', Ls, ' does NOT have endpoint ', v);
+					throw 0;
+				}
+			}
+		}
+	};
+	
+	// delete line segments whose both endpoints are the same Vertex in memory
+	// 	can be called by invalidly connected VL_network
+	this.delete_loops = function()
+	{
+		for(let i = 0; i < this.lineSegs.length; ++i)
+		{
+			if (this.lineSegs[i].r1 == this.lineSegs[i].r2){
+				this.lineSegs.splice(i, 1);
+				--i;
+			}
+		}
+	}
+	
+	// Deletes duplicates (memory-wise), that have different indices, in .vertices and .lineSegs
+	// Assumes this.verify_connectivity() was already called beforehand calling .consolidate_network()
+	this.consolidate_network = function()
+	{
+		// erase duplicate Vertex in memory
+		for(let i = 0; i < this.vertices.length; ++i)
+		{
+			for(let j = i+1; j < this.vertices.length; ++j)
+			{
+				if (this.vertices[i] == this.vertices[j])
+				{
+					this.vertices.splice(j, 1);
+					--j;
+				}
+			}
+		}
+
+		// erase duplicate lineSegs from memory
+		for(let i = 0; i < this.lineSegs.length; ++i)
+		{
+			for(let j = i+1; j < this.lineSegs.length; ++j)
+			{
+				if (this.lineSegs[i] == this.lineSegs[j])
+				{
+					this.lineSegs.splice(j, 1);
+					--j;
+				}
+			}
+		}
+	}; // end .consolidate_degenerate_lineSegs()
+}
+
+Vertex_LineSeg_Network.prototype.toString = function()
+{
+	let s = 'vertices: qty '.concat(this.vertices.length.toString());
+	for(let i in this.vertices)
+	{
+		s = s.concat('\n', this.vertices[i].toString())
+	}
+	
+	s = s.concat('\n\nline segments: qty ', this.lineSegs.length.toString());
+	for(let i in this.lineSegs)
+	{
+		s = s.concat('\n', this.lineSegs[i].toString())
+	}
+	return s;
+}
+
+// transfer incident edges from vOld to vNew, then delete vOld from this.vertices
+Vertex_LineSeg_Network.prototype.replace_vertex = function(vOld, vNew)
+{
+	vOld.transfer_incident_edges_to(vNew);
+	let index = this.vertices.indexOf(vOld);
+	if (index == -1)
+	{
+		throw "cannot find index of vertex ".concat(vOld.toString(), " to be deleted");
+	}
+	this.vertices.splice(index, 1);
+}
+
+// adds new Vertex to network, for intersecting lineSegs
+// Can accept degenerate (geometric or memory-wise) lineSeg args
+// 		consolidates same-geometric-location Vertexes to same Vertex in memory
+// DOES NOT delete lineSegs that should be deleted; instead, should-be-deleted lineSegs are marked in the return value's .mustDeleteA, .mustDeleteB properties
+// arg VL_network must contain both (distinct in memory) lineSegA & lineSegB, and VL_network must also contain each of {lineSegA, lineSegB}'s endpoints
+// returns Object {mustDeleteA: <boolean>, mustdeleteB: <boolean>, addedLineSegs: Array, description: <str>}
+//     optional 'description' property is for debugging
+// this.consolidate_network() can be called beforehand for increase speed, but is not necessary
+// This algorithm sorts cases by the number of distinct Vertexes in memory among the 4 endpoints {A.r1, A.r2, B.r1, B.r2}
+// id_generator is generator function that generates new&unique debugId strings indefinitely
+Vertex_LineSeg_Network.prototype.process_lineSeg_lineSeg_intersection = function(lineSegA, lineSegB, id_generator){
+	// endpoint Vertexes in same geometric location become same Vertex in memory
+	let LsVers = [[lineSegA, 'r1', lineSegA, 'r2'], [lineSegA, 'r1', lineSegB, 'r1'], [lineSegA, 'r1', lineSegB, 'r2'],
+				 [lineSegA, 'r2', lineSegB, 'r1'], [lineSegA, 'r2', lineSegB, 'r2'], [lineSegB, 'r1', lineSegB, 'r2']];
+	for(let i in LsVers)
+	{
+		let LsVer = LsVers[i];
+		let Ls1 = LsVer[0];
+		let endpoint1 = LsVer[1];
+		let Ls2 = LsVer[2];
+		let endpoint2 = LsVer[3];
+		if (Ls1[endpoint1] != Ls2[endpoint2] && vec2.is_same_loc(Ls1[endpoint1], Ls2[endpoint2]))
+		{
+			this.replace_vertex(Ls2[endpoint2], Ls1[endpoint1]);
+		}
+	}
+
+	let retVal = {mustDeleteA: false, mustDeleteB: false, addedLineSegs: [], description: undefined};
+	
+	// delete loop edges [created by consolidating endpoint Vertexes]
+	// handles the following cases:
+	//     1 distinct Vertex   in memory: 2 points
+	//     2 distinct Vertexes in memory: [2 points], [point & line].
+	//     3 distinct Vertexes in memory: [point & line]
+	if (lineSegA.r1 == lineSegA.r2 || lineSegB.r1 == lineSegB.r2){
+		if (lineSegA.r1 == lineSegA.r2 && lineSegB.r1 == lineSegB.r2){
+			// case 1: two points (either 1 or 2 distinct Vertexes in memory); delete the 2 loops
+			// 	this case handles the scenario where there is only 1 distinct Vertex in memory among all 4 endpoints
+			retVal.mustDeleteA = true;
+			retVal.mustDeleteB = true;
+			retVal.description = "two points";
+		}
+		else{
+			// case 2: point and line (2 or 3 distinct Vertexes in memory)
+			let remainingLine = undefined;
+			let point = undefined;
+			if (lineSegA.r1 == lineSegA.r2){
+				remainingLine = lineSegB;
+				point = lineSegA.r1;
+				retVal.mustDeleteA = true;
+			}
+			else{  // lineSegB.r1 == lineSegB.r2
+				remainingLine = lineSegA;
+				point = lineSegB.r1;
+				retVal.mustDeleteB = true;
+			}
+			
+			if (point != remainingLine.r1 && point != remainingLine.r2)
+			{
+				// case 2a: point is not one of lineSeg's endpoints, and there are 3 distinct Vertexes in memory
+				let lineDirec = remainingLine.r2.subtract(remainingLine.r1);
+				if ( vec2.is_parallel(point.subtract(remainingLine.r1), lineDirec) )
+				{
+					// case 2aA: point on infinite line
+					if (lineDirec.dot(remainingLine.r1) < lineDirec.dot(point) && lineDirec.dot(point) < lineDirec.dot(remainingLine.r2))
+					{
+						// case 2aA1: point is inside line segment; create clock hands that point in opposite directions
+						let Ls1 = this.add_wall_only(remainingLine.r1, point, id_generator.next().value);
+						let Ls2 = this.add_wall_only(remainingLine.r2, point, id_generator.next().value);
+						retVal.mustDeleteA = true;
+						retVal.mustDeleteB = true;
+						retVal.addedLineSegs.push(Ls1, Ls2);
+						retVal.description = "point inside line segment";
+					}
+					else
+					{
+						// case 2aA2: point not inside line segment; do nothing
+						retVal.description = "point on infinite line but outside line segment";
+					}
+				}
+				else
+				{
+					// case 2aB: point not on infinite line; do nothing
+					retVal.description = "point not on infinite line";
+				}
+				
+			}
+			else
+			{
+				// case 2b: point is one of lineSeg's endpoints, and there are 2 distinct Vertexes in memory); do nothing
+				retVal.description = "point and line; point is one of line's endpoints";
+			}
+			
+		}
+		return retVal;
+	}
+	
+	// All cases beyond this point have 2 geometrically non-degenerate lines
+	// Still need to handle these cases:
+	//      2 distinct Vertexes in memory: [2 lines]
+	//		3 distinct Vertexes in memory: all cases except [point & line]
+	//		4 distinct Vertexes in memory: all cases
+	
+	if ((lineSegA.r1 == lineSegB.r1 && lineSegA.r2 == lineSegB.r2) || (lineSegA.r1 == lineSegB.r2 && lineSegA.r2 == lineSegB.r1))
+	{
+		// case 3: two lines connecting same [2 distinct Vertexes in memory]; delete one of the lines
+		retVal.mustDeleteB = true;
+		retVal.description = "two lines connecting same 2 distinct Vertexes ".concat(lineSegB.toString());
+		return retVal;
+	}
+	
+	// case 4: qty 3 or 4 distinct Vertexes in memory, with both lines geometrically non-degenerate
+	let lineDirecA = lineSegA.r2.subtract(lineSegA.r1);
+	let lineDirecB = lineSegB.r2.subtract(lineSegB.r1);
+	
+	if (lineSegA.r1 == lineSegB.r1 || lineSegA.r1 == lineSegB.r2 || lineSegA.r2 == lineSegB.r1 || lineSegA.r2 == lineSegB.r2)
+	{
+		// case 4a: one of endpoints is shared by both lineSegs
+		if (vec2.is_parallel(lineDirecA, lineDirecB))
+		{
+			// case 4aA: parallel lineSegs
+			let vA = undefined;	// unjoined endpoint of lineSegA
+			let vB = undefined;	// unjoined endpoint of lineSegB
+			let jointVertex = undefined;
+
+			if (lineSegA.r1 == lineSegB.r1)
+			{
+				jointVertex = lineSegA.r1;
+				vA = lineSegA.r2;
+				vB = lineSegB.r2;
+			}
+			else if (lineSegA.r1 == lineSegB.r2)
+			{
+				jointVertex = lineSegA.r1;
+				vA = lineSegA.r2;
+				vB = lineSegB.r1;
+			}
+			else if (lineSegA.r2 == lineSegB.r1)
+			{
+				jointVertex = lineSegA.r2;
+				vA = lineSegA.r1;
+				vB = lineSegB.r2
+			}
+			else // lineSegA.r2 == lineSegB.r2
+			{
+				jointVertex = lineSegA.r2;
+				vA = lineSegA.r1;
+				vB = lineSegB.r1;
+			}
+
+			let dp = vA.subtract(jointVertex).dot( vB.subtract(jointVertex) );
+			if (dp > 0)
+			{
+				// case 4aA1: both lineSegs point away from jointVertex in same direction; convert [X---Y & X---Z] to X---Y---Z, by deleting both lineSegs and creating X---Y and Y---Z
+				let longerUnjoinedVertex =  lineDirecA.len_sq() > lineDirecB.len_sq() ? vA : vB;
+				let shorterUnjoinedVertex = lineDirecA.len_sq() > lineDirecB.len_sq() ? vB : vA;
+				let Ls1 = this.add_wall_only(jointVertex,          shorterUnjoinedVertex, id_generator.next().value);
+				let Ls2 = this.add_wall_only(shorterUnjoinedVertex, longerUnjoinedVertex, id_generator.next().value);
+				retVal.mustDeleteA = true;
+				retVal.mustDeleteB = true;
+				retVal.addedLineSegs.push(Ls1, Ls2);
+				retVal.description = "two clock hands pointing in same direction";
+			}
+			else if (dp < 0)
+			{
+				// case 4aA2: both lineSegs point away from jointVertex in opposite directions
+				if (jointVertex.incidentLineSegs.length == 2)
+				{
+					// case 4aA2-a: joint Vertex is 180 degree angle with no other lineSegs attached to joint vertex; change X---Y---Z to X---Z
+					let Ls = this.add_wall_only(vA, vB, id_generator.next().value);
+					
+					// delete jointVertex from network
+					let index = this.vertices.indexOf(jointVertex);
+					if (index == -1){
+						throw "could not find index of joint Vertex in this.vertices";
+					}
+					this.vertices.splice(index, 1);
+					
+					retVal.mustDeleteA = true;
+					retVal.mustDeleteB = true;
+					retVal.addedLineSegs.push(Ls);
+					retVal.description = "two clock hands pointing in opposite directions";
+				}
+				else
+				{
+					// case 4aA2-b: joint vertex is attached to other lineSegs in a Y-shape; do nothing
+					retVal.description = "two clock hands pointing in opposite direction, with >=1 more clock hand existing";
+				}
+			}
+			else
+			{
+				throw "cannot have dot product of clock hands be zero, since this would be the 2-Vertex point & line case";
+			}
+		}
+		else
+		{
+			//case 4aB: V-shaped clock hands; do nothing
+			retVal.description = "two clock hand at an angle";
+		}
+		return retVal;
+	}
+
+	// case 5: all four endpoints are in distinct positions geometrically
+	if (vec2.is_parallel(lineDirecA, lineDirecB))
+	{
+		// case 5a: parallel lineSegs
+		
+		if (vec2.is_parallel(lineDirecA, lineSegB.r1.subtract(lineSegA.r1)))
+		{
+			// case 5aA: lineSegs exist on same infinite line
+			const lineDirec = lineDirecA;
+			let minA = lineDirec.dot(lineSegA.r1) < lineDirec.dot(lineSegA.r2) ? lineSegA.r1 : lineSegA.r2;
+			let maxA = minA.other_endPoint(lineSegA);
+			let minB = lineDirec.dot(lineSegB.r1) < lineDirec.dot(lineSegB.r2) ? lineSegB.r1 : lineSegB.r2;
+			let maxB = minB.other_endPoint(lineSegB);
+			
+			if (minA.dot(lineDirec) <= maxB.dot(lineDirec) && minB.dot(lineDirec) <= maxA.dot(lineDirec))
+			{
+				// case 5aA1: overlapping lineSegs: delete both lineSegsA,B and [create 3 line segs: minMin---centerMin---centerMax---maxMax]
+				let vv = [lineSegA.r1, lineSegA.r2, lineSegB.r1, lineSegB.r2];
+				vv.sort(function(a, b){
+					return a.dot(lineDirec) - b.dot(lineDirec);
+				});
+				
+				let Ls1 = this.add_wall_only(vv[0], vv[1], id_generator.next().value);
+				let Ls2 = this.add_wall_only(vv[1], vv[2], id_generator.next().value);
+				let Ls3 = this.add_wall_only(vv[2], vv[3], id_generator.next().value);
+				retVal.mustDeleteA = true;
+				retVal.mustDeleteB = true;
+				retVal.addedLineSegs.push(Ls1, Ls2, Ls3);
+				retVal.description = "overlapping AABB on same infinite line\t".concat(minA.dot(lineDirec), ', ', maxA.dot(lineDirec), ', ', minB.dot(lineDirec), ', ', maxB.dot(lineDirec));
+			}
+			else
+			{
+				// case 5aA2: non-overlapping line segs; do nothing
+				retVal.description = "non-overlapping AABB on same infinite line";
+			}
+		}
+		else
+		{
+			// case 5aB: parallel but not on same infinite line; do nothing
+			retVal.description = "parallel but not on same infinite line";
+		}
+	}
+	else
+	{
+		// case 5b: non-parallel line segs; solve system of 2 linear eqns to find intersection point to find
+		//     unique params (tA, tB) such that A0 + tA*vA = B0 + tB*vB
+		let A0 = lineSegA.r1;
+		let B0 = lineSegB.r1;
+		let vA = lineDirecA;
+		let vB = lineDirecB;
+		const det = vB.x*vA.y - vA.x*vB.y;
+		let tAB = new vec2(vB.x, vA.x).mult(B0.y-A0.y).subtract(new vec2(vB.y, vA.y).mult(B0.x-A0.x)).mult(1/det);	// determinant floating point has infinite precision, so dividing by negligible float will still produce correct tA,tB. Div by zero case is already handled in vec2.is_parallel()
+		let tA = tAB.x;	// assume javascript floating point tA,tB are computed with infinite accuracy
+		let tB = tAB.y;
+		if (tA >= 0 && tA <= 1 && tB >= 0 && tB <= 1)
+		{
+			// case 5bA: intersecting line segs
+			if (tA == 0 || tA == 1 || tB == 0 || tB == 1) // T-shape case with [joint vertex snapping toward nearest lineSeg] can have multiple endpoints that snap toward closest line seg; better to let the [tA/B <0 or >1 case] and X-shaped case handle them
+			{
+				// case 5bA1: T-shape; replace X---Z with X---Y---Z, where Y is junction vertex
+				let Ls1 = undefined;
+				let Ls2 = undefined;
+				if (tA == 0)
+				{
+					Ls1 = this.add_wall_only(lineSegB.r1, A0, id_generator.next().value);
+					Ls2 = this.add_wall_only(lineSegB.r2, A0, id_generator.next().value);
+					retVal.mustDeleteB = true;
+				}
+				else if (tA == 1)
+				{
+					let junctionVertex = A0.other_endPoint(lineSegA);
+					Ls1 = this.add_wall_only(lineSegB.r1, junctionVertex, id_generator.next().value);
+					Ls2 = this.add_wall_only(lineSegB.r2, junctionVertex, id_generator.next().value);
+					retVal.mustDeleteB = true;
+				}
+				else if (tB == 0)
+				{
+					Ls1 = this.add_wall_only(lineSegA.r1, B0, id_generator.next().value);
+					Ls2 = this.add_wall_only(lineSegA.r2, B0, id_generator.next().value);
+					retVal.mustDeleteA = true;
+				}
+				else  // tB == 1
+				{
+					let junctionVertex = B0.other_endPoint(lineSegB);
+					Ls1 = this.add_wall_only(lineSegA.r1, junctionVertex, id_generator.next().value);
+					Ls2 = this.add_wall_only(lineSegA.r2, junctionVertex, id_generator.next().value);
+					retVal.mustDeleteA = true;
+				}
+				retVal.description = "T-shape";
+				retVal.addedLineSegs.push(Ls1, Ls2);
+			}
+			else
+			{
+				// case 5bA2: X-shaped intersection; add new vertex in middle of X-shape
+				let intersectVertex = new Vertex(vA.mult(tA).add(A0), [], id_generator.next().value);
+				let intersectVertex2 = this.add_vertex_keep_unique(intersectVertex);
+				retVal.addedVertex = intersectVertex2;
+				
+				let Ls1 = this.add_wall_only(lineSegA.r1, intersectVertex2, id_generator.next().value);
+				let Ls2 = this.add_wall_only(lineSegA.r2, intersectVertex2, id_generator.next().value);
+				let Ls3 = this.add_wall_only(lineSegB.r1, intersectVertex2, id_generator.next().value);
+				let Ls4 = this.add_wall_only(lineSegB.r2, intersectVertex2, id_generator.next().value);
+				retVal.mustDeleteA = true;
+				retVal.mustDeleteB = true;
+				retVal.addedLineSegs.push(Ls1, Ls2, Ls3, Ls4);
+				retVal.description = "X-shape";
+			}
+		}
+		else
+		{
+			// case 5bB: non-intersecting line segs; do nothing
+			retVal.description = "infinite lines intersect, but line segments do not intersect";
+		}
+	}
+	return retVal;
+}
+
+// generator for generating debugId
+function* gen_id(prefixStr, startId){
+	for(let i = startId; true; ++i){
+		yield prefixStr.concat(i.toString());
+	}
+}
+
+// constructor
+// Binary space partitioning tree
+// all element lineSegs whose both endpoints v have dot(v, normal) >= 0 are in frontChild
+// 	   if both endspoints' dotProds are <0, then in backChild
+//     if one endpoint on each side, then is stored in *this* BSP_Tree
+function BSP_Tree(rect, debugId, depth = 1)
+{
+	this.rect = rect;	// rectangle containing all elements geometrically; only used for computing location of children, NOT for insertion testing
+						//   each lineSeg's endpoint (x,y) has rect.x <= x < rect.x+rect.w, and similarly with y
+	this.elements = [];
+	this.debugId = debugId;
+	this.depth = depth;	// root has depth = 1
+	
+	// the following properties will be valid after *this* splits
+	this.backChild = undefined;	// left rect if splitting into left&right; top rect if splitting into top&bottom
+	this.frontChild = undefined;
+	this.normal = undefined;	// splitting line's normal vector, pointing "forward". Used for determining which child to insert into
+	this.splitPoint = undefined;	// point on splitting line; used for determining which child to insert into
+}
+
+const MAX_ELEMENTS = 6;
+const MAX_DEPTH = 10;
+BSP_Tree.prototype.insert_lineSeg = function(lineSeg)
+{
+	if (this.frontChild != undefined && this.backChild != undefined)
+	{
+		let dp1 = lineSeg.r1.subtract(this.splitPoint).dot(this.normal);
+		let dp2 = lineSeg.r2.subtract(this.splitPoint).dot(this.normal);
+		if (dp1 < 0 && dp2 < 0)
+		{
+			// back child
+			this.backChild.insert_lineSeg(lineSeg);
+			return;
+		}
+		else if (dp1 >=0 && dp2 >= 0)
+		{
+			// front child
+			this.frontChild.insert_lineSeg(lineSeg);
+			return;
+		}
+		// else neither child
+	}
+
+	this.elements.push(lineSeg);
+	if (this.elements.length > MAX_ELEMENTS && this.depth < MAX_DEPTH && this.frontChild == undefined && this.backChild == undefined){
+		this.split();
+		let elems = this.elements;
+		this.elements = [];
+		elems.forEach( function(lineSeg){ this.insert_lineSeg(lineSeg); }.bind(this) );	// transfer elements into children
+	}
+}
+
+// thows error if arg is not find in hierarchy
+// returns nothing
+BSP_Tree.prototype.remove_lineSeg = function(lineSeg)
+{
+	if (this.frontChild != undefined && this.backChild != undefined)
+	{
+		let dp1 = lineSeg.r1.subtract(this.splitPoint).dot(this.normal);
+		let dp2 = lineSeg.r2.subtract(this.splitPoint).dot(this.normal);
+		if (dp1 < 0 && dp2 < 0)
+		{
+			// back child
+			this.backChild.remove_lineSeg(lineSeg);
+			return;
+		}
+		else if (dp1 >= 0 && dp2 >= 0)
+		{
+			// front child
+			this.frontChild.remove_lineSeg(lineSeg);
+			return;
+		}
+		// else neither child
+	}
+	let index = this.elements.indexOf(lineSeg);
+	if (index == -1){
+		throw "cannot find lineSeg to remove";
+	}
+	this.elements.splice(index, 1);
+}
+
+// only creates children and populates children-specific properties; does NOT populate new children
+// automatically called by BSP_Tree.insert_lineSeg()
+BSP_Tree.prototype.split = function()
+{
+	if (this.frontChild != undefined || this.backChild != undefined){
+		throw "cannot split node that already has children!";
+	}
+	let frontRect, backRect, indicator, normal;
+	if (this.rect.w > this.rect.h){
+		// split into left & right
+		backRect  = new Rect(this.rect.x,               this.rect.y, this.rect.w/2, this.rect.h);
+		frontRect = new Rect(this.rect.x+this.rect.w/2, this.rect.y, this.rect.w/2, this.rect.h);
+		this.normal = new vec2(1, 0);
+	}else{
+		// split into top and bottom
+		frontRect = new Rect(this.rect.x, this.rect.y + this.rect.h/2, this.rect.w, this.rect.h/2);
+		backRect  = new Rect(this.rect.x, this.rect.y,                 this.rect.w, this.rect.h/2);
+		this.normal = new vec2(0, 1);
+	}
+	
+	this.frontChild = new BSP_Tree(frontRect, this.debugId.concat('_f'), this.depth+1);
+	this.backChild  = new BSP_Tree( backRect, this.debugId.concat('_b'), this.depth+1);
+	this.splitPoint = new vec2(this.rect.x + this.rect.w/2, this.rect.y + this.rect.h/2);	// point on splitting line
+}
+
+BSP_Tree.prototype.toString = function(nTabs = 0)
+{
+	return ''.concat('\t'.repeat(nTabs), this.debugId, ': ', '\tdepth=', this.depth, '\t', this.rect.toString(), '\telems=[', this.elements.map(Ls => Ls.debugId), ']\n\n', this.backChild != undefined ? this.backChild.toString(nTabs+1) : '', this.frontChild != undefined ? this.frontChild.toString(nTabs+1) : '');
+}
+
+// get number of elements in this hierarchy
+BSP_Tree.prototype.num_elems = function()
+{
+	return this.elements.length + (this.backChild  != undefined ? this.backChild .num_elems() : 0) +
+			       	      (this.frontChild != undefined ? this.frontChild.num_elems() : 0);
+}
+
+// get number of unordered pairs that must be compared in this hierarchy
+BSP_Tree.prototype.num_pairs = function()
+{
+	let totalChildElems = (this.backChild != undefined ? this.backChild.num_elems() : 0) + (this.frontChild != undefined ? this.frontChild.num_elems() : 0);
+	return (this.backChild  != undefined ? this.backChild .num_pairs() : 0) + 
+	       (this.frontChild != undefined ? this.frontChild.num_pairs() : 0) + this.elements.length*(this.elements.length+1)/2 + this.elements.length * totalChildElems;
+	// 4 classes of pairs: backChildOnly + frontChildOnly + selfOnly + self_to_child
+}
+
+// render rect only
+BSP_Tree.prototype.render = function(colorStr)
+{
+	ctx.strokeStyle = colorStr;
+	this.rect.render(colorStr);
+	if (this.frontChild != undefined){
+		this.frontChild.render(colorStr);
+	}
+	if (this.backChild != undefined){
+		this.backChild.render(colorStr);
+	}
+}
+
+// returns all elems in hierarchy
+BSP_Tree.prototype.get_elements = function()
+{
+	return this.elements.concat(this.frontChild ? this.frontChild.get_elements() : [], this.backChild ? this.backChild.get_elements() : []);
+}
+
+// returns list of all lineSegs in [deepest BSP node that can completely contain arg lineSeg] and children in hierarchy
+BSP_Tree.prototype.get_intersection_candidates = function(lineSeg)
+{
+	if (this.frontChild != undefined && this.backChild != undefined)
+	{
+		let dp1 = lineSeg.r1.subtract(this.splitPoint).dot(this.normal);
+		let dp2 = lineSeg.r2.subtract(this.splitPoint).dot(this.normal);
+		if (dp1 < 0 && dp2 < 0)
+		{
+			// back child
+			return this.elements.concat(this.backChild.get_intersection_candidates(lineSeg));
+		}
+		else if (dp1 >=0 && dp2 >= 0)
+		{
+			// front child
+			return this.elements.concat(this.frontChild.get_intersection_candidates(lineSeg));
+		}
+	}
+	return this.get_elements();
+}
+
+//constructor
+function LLIntersectResult(lineSegA, lineSegB, hasDeletedA, hasDeletedB, addedLineSegs, description, addedVertex = undefined)
+{
+	this.lineSegA = lineSegA;
+	this.lineSegB = lineSegB;
+	this.hasDeletedA = hasDeletedA;
+	this.hasDeletedB = hasDeletedB;
+	this.addedLineSegs = addedLineSegs;
+	this.description = description;
+	this.addedVertex = addedVertex;
+}
+
+LLIntersectResult.prototype.toString = function(){
+	return this.description.concat('\na,b: ', this.lineSegA.debugId, '&', this.lineSegB.debugId, '\tadd: [', this.addedLineSegs.map(Ls => Ls.debugId), ']\tdel: ', this.hasDeletedA ? this.lineSegA.debugId:'none', ',', this.hasDeletedB ? this.lineSegB.debugId:'none');
+}
+
+// constructor
+// lineseg-lineseg intersection debugger for VL_network.process_lineSeg_lineSeg_intersection() and VL_network.eliminate_lineSeg_lineSeg_intersections()
+function IntersectDebugger()
+{
+	this.intersectResults = [];
+
+	this.clear = function(){
+		this.intersectResults.splice(0);
+	};
+
+	this.add_intersect_result = function(lineSegA, lineSegB, hasDeletedA, hasDeletedB, addedLineSegs, description, addedVertex = undefined)
+	{
+		// new properties of a [debugger-displayable] intersectResult should be defined here
+		this.intersectResults.push(new LLIntersectResult(lineSegA, lineSegB,  hasDeletedA, hasDeletedB, addedLineSegs, description, addedVertex));
+	};
+	
+	// nontrivial == [added >=1 lineSeg || deleted >=1 lineSeg] during intersection test
+	// returns undefined if no subsequent indices are nontrivial
+	this.get_next_nontrivial_index = function(startIndex)
+	{
+		for(let i = startIndex+1; i < this.intersectResults.length; ++i)
+		{
+			let ir = this.intersectResults[i];
+			if (ir.hasDeletedA || ir.hasDeletedB || ir.addedLineSegs.length > 0)
+			{
+				return i;
+			}
+		}
+		return undefined;
+	};
+	
+	// nontrivial == [added >=1 lineSeg || deleted >=1 lineSeg] during intersection test
+	// returns undefined if no previous indices are nontrivial
+	this.get_prev_nontrivial_index = function(startIndex)
+	{
+		for(let i = startIndex-1; i > 0; --i)
+		{
+			let ir = this.intersectResults[i];
+			if (ir.hasDeletedA || ir.hasDeletedB || ir.addedLineSegs.length > 0)
+			{
+				return i;
+			}
+		}
+		return undefined;
+	};
+
+	this.render_intersect_result = function(index)
+	{
+		if (index < 0 || index >= this.intersectResults.length){
+			return;
+		}
+		let result = this.intersectResults[index];
+		const DEFAULT_LINE_COLOR = '#FFFFFF';
+		const ADDED_LINE_COLOR = '#00FF00';
+		const DELETED_LINE_COLOR = '#FF0000';
+		const ADDED_VERTEX_COLOR = '#22DDEE';
+		const LINE_ENDPOINT_RADIUS = 4;
+		const ADDED_VERTEX_RADIUS = 12;
+		const NUM_SAW_PERIODS = 20;
+
+		// render lineSegA and lineSegB
+		result.lineSegA.render(			result.hasDeletedA ? DELETED_LINE_COLOR : DEFAULT_LINE_COLOR, LINE_ENDPOINT_RADIUS);
+		result.lineSegA.render_debug_id(result.hasDeletedA ? DELETED_LINE_COLOR : DEFAULT_LINE_COLOR);
+		result.lineSegB.render(			result.hasDeletedB ? DELETED_LINE_COLOR : DEFAULT_LINE_COLOR, LINE_ENDPOINT_RADIUS);
+		result.lineSegB.render_debug_id(result.hasDeletedB ? DELETED_LINE_COLOR : DEFAULT_LINE_COLOR);
+		
+		// render added lineSegs
+		for(let i = 0; i < result.addedLineSegs.length; ++i)
+		{
+			let nSawPeriods = 20;
+			let amplitudeRatio = 1/30.1/(i+1);
+			result.addedLineSegs[i].render_saw(ADDED_LINE_COLOR, nSawPeriods, amplitudeRatio, LINE_ENDPOINT_RADIUS);
+			result.addedLineSegs[i].render_debug_id(ADDED_LINE_COLOR);
+		}
+
+		// render added vertices but not their debugIds
+		if (result.addedVertex != undefined)
+		{
+			result.addedVertex.render_ring(ADDED_VERTEX_COLOR, ADDED_VERTEX_RADIUS);
+			result.addedVertex.render_solid(ADDED_VERTEX_COLOR, ADDED_VERTEX_RADIUS/2);
+		}
+	};
+	
+	this.get_intersection_result_str = function(index)
+	{
+		if (index < 0 || index >= this.intersectResults.length){
+			return 'no intersection result at index '.concat(index);
+		}
+		return 'intersection result index '.concat(index, ', \t', this.intersectResults[index].toString());
+	};
+
+	this.log_all_intersect_results = function()
+	{
+		console.log('logging all intersectResults that either added or deleted lineSeg (or both)');
+		let nNontrivial = 0;
+		for(let i = 0; i < this.intersectResults.length; ++i)
+		{
+			let ir = this.intersectResults[i];
+			if (ir.hasDeletedA || ir.hasDeletedB || ir.addedLineSegs.length > 0)
+			{
+				// debug print all intersection result
+				console.log( 'index: '.concat(i, '\t', ir.toString()) );
+				++nNontrivial;
+			}
+		}
+		console.log('total '.concat(this.intersectResults.length, ' intersection tests and ', nNontrivial, ' nontrivial tests'));
+	};
+}
+let intersectDebuggerIndex = -1;
+
+// removes all redundant vertices&lineSegs, removes all degenerate lineSegs, and ensures that all no two lineSegs intersect (but may share a common Vertex).
+// assumes this.consolidate_network() has already been called, to remove duplicate lineSegs (in memory) from this.lineSegs
+// intersectDebugger's interal state updated
+Vertex_LineSeg_Network.prototype.eliminate_lineSeg_lineSeg_intersections = function(intersectDebugger){
+	if (intersectDebugger == undefined){
+		intersectDebugger = new IntersectDebugger();
+	}
+	let id_generator = gen_id('x', 0);
+	let lineSegsUnchecked = this.lineSegs.slice();	// not yet checked for intersection against any other lineSeg; is shallow clone of lineSegs
+	
+	// create BSP tree to reduce broad phase efficiency
+	let BSP_rect = new Rect(Math.min.apply(undefined, this.vertices.map(v => v.x)) - 1.0,
+							Math.min.apply(undefined, this.vertices.map(v => v.y)) - 1.0,
+							Math.max.apply(undefined, this.vertices.map(v => v.x)) + 1.0,
+							Math.max.apply(undefined, this.vertices.map(v => v.y)) + 1.0);
+	BSP_rect.w -= BSP_rect.x;
+	BSP_rect.h -= BSP_rect.y;
+	let lineSegsChecked = new BSP_Tree(BSP_rect, 'root');	// all lineSegs in this list have already been undergone pairwise intersection checking
+
+	let nLoopIter = 0;
+	while(lineSegsUnchecked.length > 0)
+	{
+		for(let i = 0; i < lineSegsUnchecked.length; ++i)	// for every unchecked lineSeg...
+		{
+			let hasDeletedUnchecked = false;
+			let LsUnchecked = lineSegsUnchecked[i];
+			for(let LsChecked of lineSegsChecked.get_intersection_candidates(LsUnchecked))	// ... test that lineSeg against every checked lineSeg that has a chance of intersecting LsUnchecked
+			{
+				const MAX_ITERATIONS = 999999
+				if (++nLoopIter > MAX_ITERATIONS)
+				{
+					// log all results to figure out what caused the infinite loop
+					if (nLoopIter == MAX_ITERATIONS + 1)
+					{
+						intersectDebugger.log_all_intersect_results();
+						this.log_network();	// capture snapshot of all un/checked lineSegs
+					}
+					throw "infinite loop error in VL_Network.eliminate_lineSeg_lineSeg_intersections()";
+				}
+				
+				let retVal = this.process_lineSeg_lineSeg_intersection(LsUnchecked, LsChecked, id_generator);
+				
+				// record intersection result in intersection debugger
+				intersectDebugger.add_intersect_result(LsUnchecked, LsChecked, retVal.mustDeleteA, retVal.mustDeleteB, retVal.addedLineSegs, retVal.description, retVal.addedVertex);
+				
+				// delete [must-delete] lineSegs from network and from (each) its own list of un/checked lineSegs
+				if (retVal.mustDeleteA){
+					let iA = lineSegsUnchecked.indexOf(LsUnchecked);
+					if (iA == -1){
+						throw "expected to find lineSegA in lineSegsUnchecked but did not find";
+					}
+					lineSegsUnchecked.splice(iA, 1);
+					this.delete_wall_only(LsUnchecked);
+				}
+				if (retVal.mustDeleteB){
+					lineSegsChecked.remove_lineSeg(LsChecked);
+					this.delete_wall_only(LsChecked);
+				}
+				
+				// add new lineSegs to lineSegsUnchecked
+				[].push.apply(lineSegsUnchecked, retVal.addedLineSegs);
+				
+				// set correct indices for next iteration
+				if (retVal.mustDeleteA){
+					--i;	// next iteration keep same i, and LsChecked will restart
+					hasDeletedUnchecked = true;
+					break;
+				}
+			} // end checked lineSegs loop
+			
+			if (!hasDeletedUnchecked)
+			{
+				// uncheckedLineSeg successfully checked against all [checked lineSegs]; remove from unchecked list and add to checked list
+				lineSegsChecked.insert_lineSeg(LsUnchecked);
+				lineSegsUnchecked.splice(i, 1);
+				--i;
+			}
+		}
+	}
+}
+
+// Prints entire VL_network to console in JSON-parseable, non-circular-referential format
+// Can recreate network (including inter-references) using VL_network.load_network_from_str()
+//    assumes all vertices have unique debugIds
+//    assumes all lineSegs have unique debugIds
+// Any vertex can have same debugId as any lineSeg (and vice versa) without [duplicate name] issue
+Vertex_LineSeg_Network.prototype.log_network = function(){
+	let lineSegs = this.lineSegs.map( Ls => ({r1: Ls.r1.debugId, r2: Ls.r2.debugId, debugId: Ls.debugId}) );
+	let vertices = this.vertices.map( v => ({x: v.x, y: v.y, debugId: v.debugId, incidentLineSegs: v.incidentLineSegs.map(Ls => Ls.debugId)}) );
+	console.log('logging VL_network:\n', JSON.stringify({lineSegs: lineSegs, vertices: vertices}));
+}
+
+// returns loaded VL_network from src string generated by VL_network.log_network()
+Vertex_LineSeg_Network.load_network_from_str = function(src){
+	let network = JSON.parse(src);
+
+	// create new VL_network properties
+	let dummyVec2 = new vec2(undefined, undefined);
+	let dummyVertex = new Vertex(dummyVec2, [], 'dummy vertex');
+	let lineSegsDict = {};
+	for(let i in network.lineSegs){
+		let debugId = network.lineSegs[i].debugId;
+		console.assert(lineSegsDict[debugId] == undefined, 'duplicate name found (', debugId, ') when loading VL_network lineSegs from string');
+		lineSegsDict[debugId] = new LineSeg(dummyVertex, dummyVertex, debugId);
+	}
+	
+	let verticesDict = {};
+	for(let i in network.vertices){
+		let v = network.vertices[i];
+		let debugId = v.debugId;
+		console.assert(verticesDict[debugId] == undefined, 'duplicate name found (', debugId, ') when loading VL_network vertices from string');
+		verticesDict[debugId] = new Vertex(new vec2(v.x, v.y), [], debugId);
+	}
+
+
+	// establish references between vertices and incident line segs, and vice versa
+	for(let i in network.lineSegs){
+		let debugId = network.lineSegs[i].debugId;
+		let r1Id = network.lineSegs[i].r1;
+		let r2Id = network.lineSegs[i].r2;
+		lineSegsDict[debugId].r1 = verticesDict[r1Id];
+		lineSegsDict[debugId].r2 = verticesDict[r2Id];
+	}
+
+	for(let i in network.vertices){
+		let v = network.vertices[i];
+		let debugId = network.vertices[i].debugId;
+		verticesDict[debugId].incidentLineSegs = v.incidentLineSegs.map(LsStr => lineSegsDict[LsStr]);
+	}
+	
+	let VL_network = new Vertex_LineSeg_Network();
+	VL_network.add_network(Object.values(verticesDict), Object.values(lineSegsDict));
+	return VL_network;
+}
+
+Vertex_LineSeg_Network.prototype.delete_isolated_points = function(){
+	for(let i = 0; i < this.vertices.length; ++i)
+	{
+		if (this.vertices[i].incidentLineSegs.length == 0)
+		{
+			this.vertices.splice(i, 1);
+			--i;
+		}
+	}
+}
+
+// Highlight-circle all vertices and render all lineSegs (but not their endpoints)
+// 		als render debugIds for all vertices and lineSegs
+Vertex_LineSeg_Network.prototype.render = function(vertexColorStr = '#0000FFFF', lineColorStr = '#FF0000FF')
+{
+	const VERTEX_SOLID_RADIUS = 2;
+	
+	for(let v of this.vertices)
+	{
+		v.render_solid(vertexColorStr, VERTEX_SOLID_RADIUS);
+		v.render_debug_id(vertexColorStr);
+	}
+	
+	for(let i in this.lineSegs)
+	{
+		let Ls = this.lineSegs[i];
+		Ls.render(lineColorStr);
+		Ls.render_debug_id(lineColorStr);
+	}
+}
+
+
+// constructor
+// stores a snapshop of activeList after each iteration for debugging
+function ActiveListIteration(activeLineSegs, addedLineSegs, deletedLineSegs, closestLineSeg, stepVertex, polygonVertices = undefined)
+{
+	this.activeLineSegs = activeLineSegs;	// after *this* iteration
+	this.addedLineSegs = addedLineSegs;	// Array
+	this.deletedLineSegs = deletedLineSegs;	// Array
+	this.closestLineSeg = closestLineSeg;
+	this.stepVertex = stepVertex;		// vertex for this iteration
+	
+	if (polygonVertices == undefined){
+		polygonVertices = [];
+	}
+	this.polygonVertices = polygonVertices;	// visibility polygon vertex(es) generated during during this iteration
+}
+
+ActiveListIteration.prototype.toString = function()
+{
+	return "TODO pass";
+}
+
+// constructor
+function ActiveListDebugger(lightSrc)
+{
+	this.lightSrc = lightSrc;
+	this.steps = [];
+	this.addedLineSegs = [];	// to be submitted to this.steps
+	this.deletedLineSegs = [];	// to be submitted to this.steps
+	this.polygonVertices = [];	// to be submitted to this.steps
+	
+	this.clear = function()
+	{
+		this.steps.splice(0);
+		this.currIndex = undefined;
+		this.addedLineSegs.splice(0);
+		this.deletedLineSegs.splice(0);
+		this.polygonVertices.splice(0);
+	};
+	
+	// adds to list of added lineSegs to be submitted to step
+	this.add_new_lineSeg = function(lineSeg)
+	{
+		this.addedLineSegs.push(lineSeg);
+	};
+	
+	// add to list of deleted lienSegs to be submitted to step
+	this.add_deleted_lineSeg = function(lineSeg)
+	{
+		this.deletedLineSegs.push(lineSeg);
+	}
+	
+	this.add_visibility_polygon_vertex = function(v)
+	{
+		this.polygonVertices.push(v);
+	}
+	
+	this.submit_step = function(activeLineSegs, closestLineSeg, stepVertex)
+	{
+		this.steps.push(new ActiveListIteration(activeLineSegs, this.addedLineSegs.slice(0), this.deletedLineSegs.slice(0), closestLineSeg, stepVertex, this.polygonVertices));
+		this.addedLineSegs = [];
+		this.deletedLineSegs = [];
+		this.polygonVertices = [];
+	};
+	
+	this.render_step = function(stepIndex, defaultColorStr = '#FFFFFFFF', addedColorStr = '#00FF00FF', deletedColorStr = '#FF0000FF', closestColorStr = '#00FFFFFF')
+	{
+		if (stepIndex < 0 || stepIndex >= this.steps.length){
+			return;
+			// cannot display invalid step
+		}
+		let step = this.steps[stepIndex];
+		// render casted ray
+		const RAY_COLOR = 'rgba(116, 46, 16, 128)';
+		new LineSeg(this.lightSrc, step.stepVertex).render(RAY_COLOR);
+		
+		// render activeList, added line segs, deleted line segs, closest line seg
+		let lineSegsColors = [];
+		lineSegsColors = lineSegsColors.concat( step .activeLineSegs.map(Ls => ({lineSeg: Ls, color: defaultColorStr})) );
+		lineSegsColors = lineSegsColors.concat( step  .addedLineSegs.map(Ls => ({lineSeg: Ls, color: addedColorStr})) );
+		lineSegsColors = lineSegsColors.concat( step.deletedLineSegs.map(Ls => ({lineSeg: Ls, color: deletedColorStr})) );
+		lineSegsColors.push( 								   					{lineSeg: step.closestLineSeg, color: closestColorStr} );
+		for(let i in lineSegsColors)
+		{
+			let Ls = lineSegsColors[i].lineSeg;
+			Ls.render(lineSegsColors[i].color);
+			Ls.render_debug_id(lineSegsColors[i].color);
+		}
+		
+		// render current iteration's vertex
+		const CURR_VERTEX_COLOR = 'rgb(234, 245, 20)';
+		const CURR_VERTEX_RADIUS = 5;
+		step.stepVertex.render_ring(CURR_VERTEX_COLOR, CURR_VERTEX_RADIUS);
+		
+		// render all visPolygon vertices generated in this iteration
+		const POLY_VERTEX_COLOR = 'rgb(34, 94, 230)';
+		const POLY_VERTEX_RADIUS = 10;
+		for(let i in step.polygonVertices){
+			step.polygonVertices[i].render_ring(POLY_VERTEX_COLOR, POLY_VERTEX_RADIUS);
+		}
+	};
+	
+	// output step to console
+	this.get_step_str = function(stepIndex)
+	{
+		if (stepIndex < 0 || stepIndex >= this.steps.length){
+			return 'no step exists at index '.concat(stepIndex);
+		}
+		return 'step index: '.concat(stepIndex, '\t', this.steps[stepIndex].toString());
+	}
+}
+let ALDebuggerStepIndex = -1;
+
+// arg is array of LineSegCache objects cached for the same ray
+// returns LineSegCache that has intersection point closest (geometrically) to rayOrigin
+function get_closest_lineSegCache(lineSegCaches){
+	let closestLineSegCache = undefined;
+	let min_tRay = Infinity;
+	for(let i in lineSegCaches){
+		if (lineSegCaches[i].tRay < min_tRay){
+			min_tRay = lineSegCaches[i].tRay;
+			closestLineSegCache = lineSegCaches[i];
+		}
+	}
+	return closestLineSegCache;
+}
+
+// lightSrc is point, border is rectangle {x: , y: , w: , h: } that must strictly contain lightSrc, and VL_network contains all lineSegs and vertices that cause shadowing
+// returns Polygon
+// if any two line segments intersect inside sweep algorithm, then visibility polygon will be incorrect, since rays are only cast toward vertices
+// pushes per-vertex results to ActiveListDebugger
+// if light src not inside border, then returns undefined
+function get_visibility_polygon(lightSrc, VL_network, border, ALDebugger, intersectDebugger){
+	VL_network.add_polygon(create_polygon_from_rect(border));
+	VL_network.assign_debug_ids();	// must assign debugIds first, otherwise rendering will throw error when attempting to render nonexistent debugId in the event that get_vis_poly() returns undefined before assigning debugIds
+	if (border.x >= lightSrc.x || border.y >= lightSrc.y || border.x + border.w <= lightSrc.x || border.y + border.h <= lightSrc.y){
+		return undefined;
+	}
+	VL_network.verify_connectivity();
+	VL_network.eliminate_lineSeg_lineSeg_intersections(intersectDebugger);
+	VL_network.delete_isolated_points();
+	VL_network.verify_connectivity();
+	
+	let vertices = VL_network.vertices;	// must keep line segments separate from vertices, since casting a ray at the vertex of a line segment may cause no intersection due to floating point underflow
+	//   each Vertex in VL_network must store a list of all lineSegs incident on v
+	let lineSegs = VL_network.lineSegs;
+	
+	// sort vertices by angle
+	// if same angle, then sort by dist from ray origin
+	//     so that [a ray containing multiple Vertices] will cause the visibility polygon will start inward and move outward radially
+	vertices.sort(function(v1, v2){
+		let relV1 = v1.subtract(lightSrc);
+		let theta1 = Math.atan2(relV1.y, relV1.x);
+		if (theta1 < 0.0){
+			theta1 += 2*Math.PI;
+		}
+		let relV2 = v2.subtract(lightSrc);
+		let theta2 = Math.atan2(relV2.y, relV2.x);
+		if (theta2 < 0.0){
+			theta2 += 2*Math.PI;
+		}
+		if (theta1-theta2 != 0.0){
+			return theta1-theta2;
+		}
+		return relV1.len_sq() - relV2.len_sq();
+	});
+	
+	let visPolygonVertices = [];
+	let activeList = [];	// unordered array of lineSegCache
+	if (ALDebugger == undefined){
+		ALDebugger = new ActiveListDebugger(lightSrc);
+	}
+	
+	// set up activeList for theta = 0
+	// note: CANNOT do first vertex twice--once at beginning and one at end--since there may be lineSegs [closer to first vertex] than first vertex itself
+	let initRayDirec = new vec2(1, 0);
+	for(let Ls = 0; Ls < lineSegs.length; ++Ls){
+		let lineSeg = lineSegs[Ls];
+		let intersectResult = get_ray_lineSeg_intersection(lightSrc, initRayDirec, lineSeg);
+		if (intersectResult.isIntersecting)
+		{
+			activeList.push(new LineSegCache(lineSeg, intersectResult.tRay));
+			ALDebugger.add_new_lineSeg(lineSeg);
+		}
+	}
+	let prevClosestLineSegCache = get_closest_lineSegCache(activeList);	// used solely for finding closest lineSeg in activeList, not for .tRay member
+	let firstVertex = initRayDirec.mult(prevClosestLineSegCache.tRay).add(lightSrc)
+	visPolygonVertices.push(firstVertex);
+	ALDebugger.add_visibility_polygon_vertex(firstVertex);
+	ALDebugger.submit_step(activeList.map(Lsc => Lsc.lineSeg), prevClosestLineSegCache.lineSeg, firstVertex);
+	
+	// sweep through all vertices in order of increasing angle
+	for(let v = 0; v < vertices.length; ++v){
+		let rayDirec = vertices[v].subtract(lightSrc);
+		let deletedClosest = false;
+		let minCosThetaRay = Infinity;	// min cosine of angle between ray and vector [from thisIteration's vertex to otherEndpointOflineSeg] among all lineSegs that are added during this vertex's iteration
+						// can compare cos theta instead of theta since cos theta is monotonic
+		let minCosThetaRay_LineSegCache = undefined;
+		
+		// add [edges incident on v] that begin at (or coincide with) sweep ray to activelist
+		for(let Ls in vertices[v].incidentLineSegs){
+			let lineSeg = vertices[v].incidentLineSegs[Ls];
+			let intersectResult = get_ray_lineSeg_intersection(lightSrc, rayDirec, lineSeg);
+			
+			// see if incident edge is already in activeList
+			let index = activeList.map(aL => aL.lineSeg).indexOf(lineSeg);
+			if (index != -1)
+			{
+				// delete lineSeg from activeList
+				if (activeList[index] == prevClosestLineSegCache){
+					deletedClosest = true;
+				}
+				
+				ALDebugger.add_deleted_lineSeg(lineSeg);
+				activeList.splice(index, 1);
+			}
+			else
+			{
+				// add lineSeg to activeList
+				let Lsc = new LineSegCache(lineSeg, intersectResult.tRay);
+				activeList.push(Lsc);
+				ALDebugger.add_new_lineSeg(lineSeg);
+				
+				// find added lineSeg that points toward lightSrc the most
+				// ERROR PREVIOUSLY HERE: compared vecAdded.dot(rayDirec) instead of cosThetaRay
+				let vecAdded = vertices[v].other_endPoint(lineSeg).subtract(vertices[v]);
+				let cosThetaRay = vecAdded.dot(rayDirec) / vecAdded.len();	// is actually scaled by magnitude of rayDirec, but all addedLineSegs have their cosTheta scaled by same factor
+				if (cosThetaRay < minCosThetaRay){
+					minCosThetaRay = cosThetaRay;
+					minCosThetaRay_LineSegCache = Lsc;
+				}
+			}
+		} // end loop through incident line segs
+		
+		if (deletedClosest)
+		{
+			// case 1: new vertex terminates previous closest lineSeg
+			
+			if (minCosThetaRay_LineSegCache != undefined)
+			{
+				// case 1a: this vertex begins new closest lineSeg
+				visPolygonVertices.push(vertices[v]);
+				prevClosestLineSegCache = minCosThetaRay_LineSegCache;
+				ALDebugger.add_visibility_polygon_vertex(vertices[v]);
+			}
+			else
+			{
+				// case 1b: this vertex does not begin new closest lineSeg; must find new closest line seg from among existing activeList
+				for(let i = 0; i < activeList.length; ++i){	// update activeList's tRays
+					let intersectResult = get_ray_lineSeg_intersection(lightSrc, rayDirec, activeList[i].lineSeg);
+					if (!intersectResult.isIntersecting)
+					{
+						throw 'should intersect activeList element but does not';
+					}
+					
+					activeList[i].tRay = intersectResult.tRay;
+				}
+				let closestLineSegCache = get_closest_lineSegCache(activeList);
+				
+				visPolygonVertices.push(vertices[v]);
+				ALDebugger.add_visibility_polygon_vertex(vertices[v]);
+				let v2 = rayDirec.mult(closestLineSegCache.tRay).add(lightSrc);
+				visPolygonVertices.push(v2);
+				ALDebugger.add_visibility_polygon_vertex(v2);
+				prevClosestLineSegCache = closestLineSegCache;
+			}
+		}
+		else
+		{
+			// case 2: new vertex does not terminate previous closest lineSeg
+			let intersectResult = get_ray_lineSeg_intersection(lightSrc, rayDirec, prevClosestLineSegCache.lineSeg);
+			let dv = vertices[v].subtract(lightSrc);
+			if (!vec2.is_parallel(rayDirec, dv)){
+				throw 'vertex must be on rayDirection line';
+			}
+			let tV = dv.dot(rayDirec)/rayDirec.dot(rayDirec);
+			if (tV < intersectResult.tRay)
+			{
+				// case 2a: new vertex is closer than previous closest lineSeg
+				
+				let v2 = rayDirec.mult(intersectResult.tRay).add(lightSrc);
+				visPolygonVertices.push(v2);
+				ALDebugger.add_visibility_polygon_vertex(v2);
+				if (minCosThetaRay_LineSegCache == undefined)
+				{
+					throw ''.concat('did not find new lineSeg beginning at this vertex even though this vertex should birth a new lineSeg',
+					'; also, current Vertex (', vertices[v].debugId, ') should terminate prevClosestLineSeg (', prevClosestLineSegCache.debugId, ') but doesn\'t; this may happen when lineSegs intersect, and the prevClosestLineSeg desyncs with actual previous closest lineSeg');
+				}
+				prevClosestLineSegCache = minCosThetaRay_LineSegCache;
+				visPolygonVertices.push(vertices[v]);
+				ALDebugger.add_visibility_polygon_vertex(vertices[v]);
+			}
+			// case 2b: new vertex is further than previous closest lineSeg
+			//     push nothing
+		}
+		ALDebugger.submit_step(activeList.map(Lsc => Lsc.lineSeg), prevClosestLineSegCache.lineSeg, vertices[v]);
+	}	// end sweep algorithm
+	
+	// final iteration: theta = 2pi
+	let intersectResult = get_ray_lineSeg_intersection(lightSrc, initRayDirec, prevClosestLineSegCache.lineSeg);
+	if (!intersectResult.isIntersecting){
+		throw "expected yes intersection in final iteration of visibility polygon algorithm but not intersection found";
+	}
+	let finalVertex = initRayDirec.mult(intersectResult.tRay).add(lightSrc);
+	visPolygonVertices.push(finalVertex);
+	ALDebugger.add_visibility_polygon_vertex(finalVertex);
+	ALDebugger.submit_step(activeList.map(Lsc => Lsc.lineSeg), prevClosestLineSegCache.lineSeg, finalVertex);
+	
+	// assign debugIds to newly generated polygon vertices
+	let debugId = 0;
+	for(let i in visPolygonVertices)
+	{
+		if (!(visPolygonVertices[i] instanceof Vertex))
+		{
+			visPolygonVertices[i] = new Vertex(visPolygonVertices[i], [], 'v_'.concat(++debugId));
+		}
+	}
+	
+	return new Polygon(visPolygonVertices);
+}
+
+// constructor
+// doesn't interact with other Particles
+const gravityCenter = new vec2(CANVAS_WIDTH*3/4, CANVAS_HEIGHT*3/4);
+const GRAVITY_MAG = 0.15;
+const FRICTION = 0.985;
+function BouncingShape(x, y, vx, vy, polygon, theta0, omega){
+	this.pos = new vec2(x, y);
+	this.vel = new vec2(vx, vy);
+	this.polygon = polygon;
+	this.initPolygon = polygon;
+	this.theta = theta0;	// radians
+	this.omega = omega;	// radians/frame
+	
+	this.update = function(frame)
+	{
+		// apply central gravity and friction, and euler integration
+		let accel = new vec2(0, GRAVITY_MAG);
+		this.vel = this.vel.add(accel);
+		this.vel = this.vel.mult(FRICTION);
+		this.theta += this.omega;
+		this.pos = this.pos.add(this.vel);
+		
+		// bounce off walls elastically
+		if (this.pos.x < 0){
+			this.pos.x *= -1;
+			this.vel.x *= -1;
+		}
+		if (this.pos.y < 0){
+			this.pos.y *= -1;
+			this.vel.y *= -1;
+		}
+		if (this.pos.x >  CANVAS_WIDTH){
+			this.pos.x -= 2*(this.pos.x -  CANVAS_WIDTH);
+			this.vel.x *= -1;
+		}
+		/*
+		if (this.pos.y > CANVAS_HEIGHT*0.75){
+			this.pos.y -= 2*(this.pos.y - CANVAS_HEIGHT*0.75);
+			this.vel.y *= -1;
+		}
+		*/
+		
+		this.polygon = this.initPolygon.rotate(new vec2(0, 0), this.theta).translate(this.pos);
+	};
+	
+	this.is_dead = function()
+	{
+		return this.pos.y > CANVAS_HEIGHT*2;
+	}
+
+	this.get_polygon = function()
+	{
+		return this.polygon
+	};
+
+	this.render = function(colorStr)
+	{
+		this.polygon.render(colorStr);
+	};
+}
+
+// create polygon roughly centered at origin, with nSides sides (possibly self-intersecting)
+// random position/velocity/vertices, random angle and angular velocity
+BouncingShape.create_random_shape = function(nSides)
+{
+	if (nSides == undefined || nSides < 3){
+		throw "cannot create bouncing polygon with <3 sides";
+	}
+
+	const MAX_RADIUS = 30;
+	let polygon = new Polygon(new Array(nSides).fill(0).map(x => new vec2(2*Math.random()*MAX_RADIUS, 2*Math.random()*MAX_RADIUS)));
+
+	const MIN_VEL = 0.13;
+	const MAX_VEL = 0.43;
+	let speed = Math.random()*(MAX_VEL-MIN_VEL) + MIN_VEL;
+	let vTheta = Math.random()*2*Math.PI;
+	const MAX_OMEGA = 0.210;
+	return new BouncingShape(Math.random()*CANVAS_WIDTH, Math.random()*CANVAS_HEIGHT,
+				 speed*Math.cos(vTheta), speed*Math.sin(vTheta),
+				 polygon, Math.random()*2*Math.PI, (2*Math.random()-1)*MAX_OMEGA);
+}
+
+// create polygon roughly centered at origin, with nSides sides (possibly self-intersecting)
+// random position/velocity/vertices, random angle and angular velocity
+// returns BouncingShape, not Polygon
+BouncingShape.create_regular_polygon = function(nSides)
+{
+	if (nSides == undefined || nSides < 3){
+		throw "cannot create bouncing polygon with <3 sides";
+	}
+
+	const MAX_RADIUS = 11.8;
+	const MIN_RADIUS = 3;
+	let radius = Math.random()*(MAX_RADIUS-MIN_RADIUS) + MIN_RADIUS;
+	let polygon = new Polygon(new Array(nSides).fill(0).map((x, i) => new vec2(Math.cos(i/nSides*2*Math.PI)*radius, Math.sin(i/nSides*2*Math.PI)*radius)));
+
+	const MIN_VEL = 0.13;
+	const MAX_VEL = 0.43;
+	let speed = Math.random()*(MAX_VEL-MIN_VEL) + MIN_VEL;
+	let vTheta = Math.random()*2*Math.PI;
+	const MAX_OMEGA = 0.210;
+	return new BouncingShape(Math.random()*CANVAS_WIDTH, Math.random()*CANVAS_HEIGHT,
+				 speed*Math.cos(vTheta), speed*Math.sin(vTheta),
+				 polygon, Math.random()*2*Math.PI, (2*Math.random()-1)*MAX_OMEGA);
+}
+
+BouncingShape.create_star = function(nPoints, minRadius, maxRadius)
+{
+	if (nPoints == undefined || nPoints < 3){
+		throw "cannot create bouncing star with <3 points";
+	}
+
+	let vertices = [];
+	for(let i = 0; i < nPoints; ++i)
+	{
+		vertices.push(new vec2(Math.cos((i+0  )/nPoints*2*Math.PI)*minRadius, Math.sin((i+0  )/nPoints*2*Math.PI)*minRadius));
+		vertices.push(new vec2(Math.cos((i+0.5)/nPoints*2*Math.PI)*maxRadius, Math.sin((i+0.5)/nPoints*2*Math.PI)*maxRadius));
+	}
+	let polygon = new Polygon(vertices);
+
+	const MIN_VEL = 6.13;
+	const MAX_VEL = 13.53;
+	let speed = Math.random()*(MAX_VEL-MIN_VEL) + MIN_VEL;
+	let vTheta = Math.random()*Math.PI/3 - Math.PI*2/3;
+	const MAX_OMEGA = 0.110;
+	return new BouncingShape(CANVAS_WIDTH/2, CANVAS_HEIGHT*0.75,
+				 speed*Math.cos(vTheta), speed*Math.sin(vTheta),
+				 polygon, Math.random()*2*Math.PI, (2*Math.random()-1)*MAX_OMEGA);
+}
+
+function update_cursor_world_coords_display(worldX, worldY)
+{
+	document.getElementById('coords').innerHTML = 'mouse world coords: ('.concat(worldX, ', ', worldY, ')');
+}
+
+function update_fps_display(deltaTms)
+{
+	document.getElementById('fps').innerHTML = 'fps: '.concat((1000/deltaTms).toFixed(1));
+}
+
+// lehmer linear congruential generator
+// returns nArgs psuedorandom numbers uniformly distributed in [0, 1)
+// m is prime, and multiplier is largest int (mod m) with largest multiplicative order mod m
+// by design, seed is coprime to RNG_MOD
+const RNG_MULTIPLIER = 134;
+const RNG_MOD = 137;
+const RNG_OFFSET = 8;	// 2^RNG_OFFSET > RNG_MOD
+function rng(seedStr, nArgs = 1)
+{
+	if (nArgs <= 0){
+		throw 'cannot generate non-positive quantity of random numbers';
+	}
+	
+	// convert seedStr to hash mod RNG_MOD
+	let powMod = 1;
+	let hash = seedStr.charCodeAt(0);
+	for(let i = 1; i < seedStr.length; ++i)
+	{
+		powMod = (128*powMod) % RNG_MOD;
+		hash += seedStr.charCodeAt(i)*powMod;	// hash = s[0] + s[1]*128^1 + s[2]*128^2 + s[3]*128^3 + ... + s[n]*128^n (mod RNG_MOD)
+		// 128 because alphabet ascii is in range [32, 126]
+	}
+	let x = hash % RNG_MOD;	// seed
+	
+	// offset a fixed number of terms in order to countert initial predictability
+	for(let i = 0; i < RNG_OFFSET; ++i){
+		x = x*RNG_MULTIPLIER % RNG_MOD;
+	}
+	
+	let rNums = [];
+	for(let i = 0; i < nArgs; ++i){
+		x = x*RNG_MULTIPLIER % RNG_MOD;
+		rNums.push(x);
+	}
+	
+	return rNums.map(x => x/RNG_MOD);
+}
+
+// level geometry
+let lightSrc = new Vertex(new vec2(1033, 142), [], 'lightSrc');
+let border = {x: 30, y: 40, w: CANVAS_WIDTH-60, h: CANVAS_HEIGHT-80};
+let wall = new LineSeg(new vec2(490, 431), new vec2(450, 430), 'wall');
+let obstaclePolygonSrc = new Polygon([new vec2(20, 60), new vec2(130, 120), new vec2(-10, 145)]);
+let obstacleTheta = 0;
+let obstacleDstTheta = 0;
+let gamePaused = false;
+let mustImmediatePause = false;
+let mouseDownLoc = undefined;	// vec2
+let dragRect = new Rect();	// region where mouse is dragged over
+let shutterWalls = [];
+let currMouseWorldCoords = new vec2(border.x + border.w/2, border.y + border.h/2);
+let bouncingShapes = [];
+const MAX_BOUNCING_SHAPES = 18;
+
+let VL_network_src = '{"lineSegs":[{"r1":0,"r2":1,"debugId":0},{"r1":4,"r2":2,"debugId":3},{"r1":5,"r2":6,"debugId":4},{"r1":6,"r2":7,"debugId":5},{"r1":7,"r2":8,"debugId":6},{"r1":8,"r2":5,"debugId":7},{"r1":9,"r2":10,"debugId":"w_0"},{"r1":11,"r2":12,"debugId":"w_1"},{"r1":13,"r2":14,"debugId":"w_2"},{"r1":15,"r2":16,"debugId":"w_3"},{"r1":17,"r2":18,"debugId":"w_4"},{"r1":19,"r2":20,"debugId":"w_5"},{"r1":21,"r2":22,"debugId":14},{"r1":22,"r2":23,"debugId":15},{"r1":23,"r2":24,"debugId":16},{"r1":21,"r2":"x0","debugId":"x2"},{"r1":2,"r2":"x0","debugId":"x3"},{"r1":3,"r2":"x0","debugId":"x4"},{"r1":24,"r2":"x5","debugId":"x6"},{"r1":"x0","r2":"x5","debugId":"x7"},{"r1":3,"r2":"x5","debugId":"x8"},{"r1":4,"r2":"x5","debugId":"x9"}],"vertices":[{"x":490,"y":431,"debugId":0,"incidentLineSegs":[0]},{"x":450,"y":430,"debugId":1,"incidentLineSegs":[0]},{"x":-10,"y":145,"debugId":4,"incidentLineSegs":[3,"x9"]},{"x":20,"y":60,"debugId":2,"incidentLineSegs":[3,"x3"]},{"x":130,"y":120,"debugId":3,"incidentLineSegs":["x4","x8"]},{"x":null,"y":null,"debugId":5,"incidentLineSegs":[4,7]},{"x":null,"y":null,"debugId":6,"incidentLineSegs":[5,4]},{"x":null,"y":null,"debugId":7,"incidentLineSegs":[6,5]},{"x":null,"y":null,"debugId":8,"incidentLineSegs":[7,6]},{"x":300,"y":360,"debugId":12,"incidentLineSegs":["w_1"]},{"x":570,"y":440,"debugId":23,"incidentLineSegs":[16,15]},{"x":30,"y":440,"debugId":24,"incidentLineSegs":[16,"x6"]},{"x":30,"y":137.85714285714283,"debugId":"x5","incidentLineSegs":["x6","x7","x8","x9"]},{"x":204.73720558371173,"y":305,"debugId":14,"incidentLineSegs":["w_2"]},{"x":30,"y":65.4545454545455,"debugId":"x0","incidentLineSegs":["x2","x3","x4","x7"]},{"x":30,"y":40,"debugId":21,"incidentLineSegs":[14,"x2"]},{"x":190,"y":250,"debugId":15,"incidentLineSegs":["w_3"]},{"x":204.73720558371173,"y":195.00000000000003,"debugId":16,"incidentLineSegs":["w_3"]},{"x":244.99999999999994,"y":154.73720558371178,"debugId":17,"incidentLineSegs":["w_4"]},{"x":300,"y":140,"debugId":18,"incidentLineSegs":["w_4"]},{"x":355,"y":154.73720558371176,"debugId":19,"incidentLineSegs":["w_5"]},{"x":395.2627944162882,"y":194.99999999999994,"debugId":20,"incidentLineSegs":["w_5"]},{"x":570,"y":40,"debugId":22,"incidentLineSegs":[15,14]},{"x":410,"y":250,"debugId":9,"incidentLineSegs":["w_0"]},{"x":395.2627944162883,"y":305,"debugId":10,"incidentLineSegs":["w_0"]},{"x":245.00000000000003,"y":345.2627944162883,"debugId":13,"incidentLineSegs":["w_2"]},{"x":355,"y":345.2627944162882,"debugId":11,"incidentLineSegs":["w_1"]}]}';
+
+let mustOverwriteNetwork = false;
+let prevFrameTime = new Date().getTime();
+
+var game = {
+	// set canvas and create Context
+	
+	setup: function(){
+		canvas = document.getElementById("myCanvas");
+		canvas.width = CANVAS_WIDTH;
+		canvas.height = CANVAS_HEIGHT;
+		ctx = canvas.getContext("2d");
+		canvas.style.width = CANVAS_WIDTH.toString() + "px";
+		canvas.style.height = CANVAS_HEIGHT.toString() + "px";
+		var rect = canvas.getBoundingClientRect();
+		xCanvas = rect.x;
+		yCanvas = rect.y;
+		
+		
+		// handle mouse motion
+		window.addEventListener('mousemove', function(e){
+			xMouse = e.clientX - xCanvas;
+			yMouse = e.clientY - yCanvas;
+			
+			currMouseWorldCoords = new vec2(xMouse, yMouse).camera_to_world_coords(cameraRect);
+			
+			// translate screen mouse coords to camera coords
+			lightSrc = new vec2(xMouse, yMouse).camera_to_world_coords(cameraRect);
+			
+			if (mouseDownLoc != undefined)
+			{
+				dragRect.x = Math.min(xMouse,  mouseDownLoc.x);
+				dragRect.y = Math.min(yMouse,  mouseDownLoc.y);
+				dragRect.w = Math.abs(xMouse - mouseDownLoc.x);
+				dragRect.h = Math.abs(yMouse - mouseDownLoc.y);
+			}
+			
+			update_cursor_world_coords_display(lightSrc.x, lightSrc.y);
+		}.bind(this));
+		
+		// handle mouse click down
+		window.addEventListener('mousedown', function(e){
+			xMouse = e.clientX - xCanvas;
+			yMouse = e.clientY - yCanvas;			
+
+			// handle mouse here
+			mouseDownLoc = new vec2(xMouse, yMouse);
+		}.bind(this));
+		
+		// handle mouse click up
+		window.addEventListener('mouseup', function(e){
+			xMouse = e.clientX - xCanvas;
+			yMouse = e.clientY - yCanvas;
+			
+			const DRAG_MIN_SIZE = 5;
+			if (dragRect.w >= DRAG_MIN_SIZE && dragRect.h >= DRAG_MIN_SIZE)
+			{
+				// zoom in to mouse drag box
+				let cameraCenter = new vec2(dragRect.x + dragRect.w/2, dragRect.y + dragRect.h/2).camera_to_world_coords(cameraRect);
+				if (dragRect.w/dragRect.h > CANVAS_WIDTH/CANVAS_HEIGHT)
+				{
+					// width of mouse drag box becomes new camera rect width
+					dstCameraRect.w = dragRect.w/CANVAS_WIDTH*dstCameraRect.w;
+					dstCameraRect.h = dstCameraRect.w/CANVAS_WIDTH*CANVAS_HEIGHT;
+				}
+				else
+				{
+					// height of mouse drag box becomes new camera rect width
+					dstCameraRect.h = dragRect.h/CANVAS_HEIGHT*dstCameraRect.h;
+					dstCameraRect.w = dstCameraRect.h/CANVAS_HEIGHT*CANVAS_WIDTH;
+				}
+				dstCameraRect.x = cameraCenter.x - dstCameraRect.w/2;
+				dstCameraRect.y = cameraCenter.y - dstCameraRect.h/2;
+			}
+			
+			// handle mouse here
+			mouseDownLoc = undefined;
+			dragRect.x = undefined;
+			dragRect.y = undefined;
+			dragRect.w = undefined;
+			dragRect.h = undefined;
+		}.bind(this));
+		
+		// handle touch start
+		window.addEventListener('touchstart', function(e){
+			e.preventDefault();	// don't pan/zoom screen
+			// handle touchStart here
+			// let touchStart0 = new vec2(e.touches[0].clientX, e.touches[0].clientY);
+		}.bind(this), {passive: false});
+		
+		// handle touch move
+		window.addEventListener('touchmove', function(e){
+			e.preventDefault();	// don't pan/zoom screen
+			// handle touchMove here
+			// let touch0 = new vec2(e.touches[0].clientX, e.touches[0].clientY);
+		}.bind(this), {passive: false});
+		
+		// handle touch move
+		window.addEventListener('touchend', function(e){
+			e.preventDefault();	// don't pan/zoom screen
+			// handle touchEnd here
+			// e.touches[0].clientX, e.touches[0].clientY;
+		}.bind(this), {passive: false});
+		
+		const CAMERA_TRANSLATE_SPEED = 129.56;	//  camera pixels per key press
+		const CAMERA_ZOOM_SPEED = 1.32;		//  camera width/height expands by this factor every key press
+		window.addEventListener('keydown', function(e){
+			if (e.key == 'a'){
+				// rotate one frame
+				obstacleDstTheta += 5/63.5;
+			}else if(e.key == 's'){
+				obstacleDstTheta -= 5/63.5;
+			}else if(e.key == 'q'){
+				--ALDebuggerStepIndex;
+				console.log(this.ALDebugger.get_step_str(ALDebuggerStepIndex));
+			}else if(e.key == 'w'){
+				++ALDebuggerStepIndex;
+				console.log(this.ALDebugger.get_step_str(ALDebuggerStepIndex));
+			}else if(e.key == 'p'){
+				gamePaused = !gamePaused;
+				mustImmediatePause = false;
+				console.log('game pause toggle; paused? ', gamePaused ? 'yes' : 'no');
+			}else if(e.key == 'j'){
+				--intersectDebuggerIndex;
+				console.log(this.intersectDebugger.get_intersection_result_str(intersectDebuggerIndex));
+			}else if(e.key == 'k'){
+				++intersectDebuggerIndex;
+				console.log(this.intersectDebugger.get_intersection_result_str(intersectDebuggerIndex));
+			}else if(e.key == 'J'){
+				let index = this.intersectDebugger.get_prev_nontrivial_index(intersectDebuggerIndex);
+				if (index != undefined){
+					intersectDebuggerIndex = index;
+				}else{
+					console.log('failed to jump to previous nontrivial intersect index');
+				}
+				console.log(this.intersectDebugger.get_intersection_result_str(intersectDebuggerIndex));
+			}else if(e.key == 'K'){
+				let index = this.intersectDebugger.get_next_nontrivial_index(intersectDebuggerIndex);
+				if (index != undefined){
+					intersectDebuggerIndex = index;
+				}else{
+					console.log('failed to jump to next nontrivial intersect index');
+				}
+				console.log(this.intersectDebugger.get_intersection_result_str(intersectDebuggerIndex));
+			}else if(e.key == 'n'){
+				intersectDebuggerIndex -= 67171;
+				console.log(this.intersectDebugger.get_intersection_result_str(intersectDebuggerIndex));
+			}else if(e.key == 'm'){
+				intersectDebuggerIndex += 67171;
+				console.log(this.intersectDebugger.get_intersection_result_str(intersectDebuggerIndex));
+			}else if(e.key == 'u'){
+				this.intersectDebugger.log_all_intersect_results();
+			}else if(e.key == 'y'){
+				this.visPolyVL_network.log_network();
+			}else if(e.key == '1'){
+				dstCameraRect.x -= CAMERA_TRANSLATE_SPEED*dstCameraRect.w/CANVAS_WIDTH;
+			}else if(e.key == '2'){
+				dstCameraRect.y += CAMERA_TRANSLATE_SPEED*dstCameraRect.w/CANVAS_HEIGHT;
+			}else if(e.key == '3'){
+				dstCameraRect.y -= CAMERA_TRANSLATE_SPEED*dstCameraRect.w/CANVAS_HEIGHT;
+			}else if(e.key == '4'){
+				dstCameraRect.x += CAMERA_TRANSLATE_SPEED*dstCameraRect.w/CANVAS_WIDTH;
+			}else if(e.key == '-'){
+				// camera zoom out from center of screen; camera rectangle expands
+				let cameraCenter = new vec2(dstCameraRect.x + dstCameraRect.w/2, dstCameraRect.y + dstCameraRect.h/2);
+				dstCameraRect.w *= CAMERA_ZOOM_SPEED;
+				dstCameraRect.h *= CAMERA_ZOOM_SPEED;
+				let newCameraXY = cameraCenter.subtract(new vec2(dstCameraRect.w/2, dstCameraRect.h/2));
+				dstCameraRect.x = newCameraXY.x;
+				dstCameraRect.y = newCameraXY.y;
+			}else if(e.key == '='){
+				// camera zoom in to center of screen; camera rectangle shrinks
+				let cameraCenter = new vec2(dstCameraRect.x + dstCameraRect.w/2, dstCameraRect.y + dstCameraRect.h/2);
+				dstCameraRect.w /= CAMERA_ZOOM_SPEED;
+				dstCameraRect.h /= CAMERA_ZOOM_SPEED;
+				let newCameraXY = cameraCenter.subtract(new vec2(dstCameraRect.w/2, dstCameraRect.h/2));
+				dstCameraRect.x = newCameraXY.x;
+				dstCameraRect.y = newCameraXY.y;
+			}else if(e.key == '7'){
+				// output dstCamera coords
+				console.log(cameraRect);
+			}else if(e.key == '9'){
+				// zoom into problematic region
+				dstCameraRect = Object.create({x: 369.91310347995386, y: 241.30570711425912, w: 36.20194377671299, h: 28.96155502137039});
+			}else if(e.key == '0'){
+				// reset camera
+				dstCameraRect = {x: 0, y: 0, w: CANVAS_WIDTH, h: CANVAS_HEIGHT};
+			}else if(e.key == '.'){
+				// advance 1 frame, then pause
+				dstCameraRect = {x: 0, y: 0, w: CANVAS_WIDTH, h: CANVAS_HEIGHT};
+				gamePaused = false;
+				mustImmediatePause = true;
+				console.log('advance 1 frame');
+			}
+		}.bind(this));
+		
+		// load resources
+		
+	},
+	
+	update: function(){
+		// gently move cameraRect toward dstCameraRect
+		const CAMERA_DECAY_FACTOR = 0.1;	// fraction of difference covered in one frame
+		cameraRect.x += (dstCameraRect.x - cameraRect.x)*CAMERA_DECAY_FACTOR;
+		cameraRect.y += (dstCameraRect.y - cameraRect.y)*CAMERA_DECAY_FACTOR;
+		cameraRect.w += (dstCameraRect.w - cameraRect.w)*CAMERA_DECAY_FACTOR;
+		cameraRect.h += (dstCameraRect.h - cameraRect.h)*CAMERA_DECAY_FACTOR;
+
+		update_cursor_world_coords_display(lightSrc.x, lightSrc.y);
+		
+		let currT = new Date().getTime();
+		if (frame % 10 == 0){
+			update_fps_display(currT - prevFrameTime);
+		}
+		prevFrameTime = currT;
+		
+		// game logic here
+		if (!gamePaused)
+		{
+			if (mustImmediatePause)
+			{
+				gamePaused = true;
+			}
+			
+			if (frame == 0)
+			{
+				// on first frame, MUST generate visibility polygon (otherwise no graphical display), so lightSrc must be valid
+				lightSrc.x = 227
+				lightSrc.y = 374;
+			}
+			
+			// advance light source toward cursor
+			const LIGHT_SRC_CHASE_SPEED = 0.21;
+			lightSrc = currMouseWorldCoords.subtract(lightSrc).mult(LIGHT_SRC_CHASE_SPEED).add(lightSrc);
+			if (!mustOverwriteNetwork)
+			{
+				// advance angle of obstacle triangle toward destination angle
+				const OBSTACLE_ROTATE_SPEED = 0.192;
+				obstacleTheta += (obstacleDstTheta - obstacleTheta)*OBSTACLE_ROTATE_SPEED;
+				
+				// generate more bouncing shapes
+				let BOUNCING_MIN_SIDES = 3;
+				let BOUNCING_MAX_SIDES = 11;
+				const SMALL_STAR_RADIUS = 10;
+				const LARGE_STAR_RADIUS = 17;
+				for(let i = bouncingShapes.length; i < MAX_BOUNCING_SHAPES; ++i){
+					let nSides = Math.floor(Math.random()*(BOUNCING_MAX_SIDES - BOUNCING_MIN_SIDES) + BOUNCING_MIN_SIDES);
+					//bouncingShapes.push(BouncingShape.create_regular_polygon(nSides));
+					//bouncingShapes.push(BouncingShape.create_random_shape(nSides));
+					let scale = Math.random();
+					bouncingShapes.push(BouncingShape.create_star(nSides, SMALL_STAR_RADIUS*scale, LARGE_STAR_RADIUS*scale));
+				}
+				
+				// move bouncing shapes
+				for(let i = 0; i < bouncingShapes.length; ++i)
+				{
+					bouncingShapes[i].update(frame);
+					if (bouncingShapes[i].is_dead()){
+						bouncingShapes.splice(i, 1);
+						--i;
+					}
+				}
+				
+				// create VL_network and add polygons to it
+				this.visPolyVL_network = new Vertex_LineSeg_Network();
+				this.visPolyVL_network.add_wall(wall.r1, wall.r2);
+				obstaclePolygon = obstaclePolygonSrc.rotate(new vec2(320, 80), obstacleTheta);
+				this.visPolyVL_network.add_polygon(obstaclePolygon);
+				
+				for(let i = 0; i < bouncingShapes.length; ++i){
+					this.visPolyVL_network.add_polygon(bouncingShapes[i].get_polygon());
+				}
+				
+				// add circular shutter
+				const CIRCLE_SHUTTER_RADIUS = 110;
+				const circleShutterCenter = new vec2(300, 250);
+				const NUM_SHUTTERS = 0;
+				shutterWalls = [];
+				const SHUTTER_OMEGA = -0.0039;
+				for(let i = 0; i < NUM_SHUTTERS; ++i)
+				{
+					let theta1 =      i *2*Math.PI/NUM_SHUTTERS + SHUTTER_OMEGA*frame;
+					let theta2 = (i+0.5)*2*Math.PI/NUM_SHUTTERS + SHUTTER_OMEGA*frame;
+					let sh1 = new vec2(Math.cos(theta1), Math.sin(theta1)).mult(CIRCLE_SHUTTER_RADIUS).add(circleShutterCenter);
+					let sh2 = new vec2(Math.cos(theta2), Math.sin(theta2)).mult(CIRCLE_SHUTTER_RADIUS).add(circleShutterCenter);
+					let shutterWall = this.visPolyVL_network.add_wall(sh1, sh2, 'w_'.concat(i));
+					shutterWalls.push(shutterWall);
+				}
+				
+				this.visPolyVL_network.delete_loops();
+				this.visPolyVL_network.consolidate_network();
+				this.visPolyVL_network.verify_connectivity();
+			}
+			else
+			{
+				// overwrite VL_network for debugging
+				this.visPolyVL_network = Vertex_LineSeg_Network.load_network_from_str(VL_network_src);
+				this.visPolyVL_network.delete_loops();
+				this.visPolyVL_network.consolidate_network();
+				this.visPolyVL_network.verify_connectivity();
+			}
+			
+			this.ALDebugger = new ActiveListDebugger(new vec2(lightSrc.x, lightSrc.y));
+			this.intersectDebugger = new IntersectDebugger();
+
+			try{
+				this.visibilityPolygon = get_visibility_polygon(lightSrc, this.visPolyVL_network, border, this.ALDebugger, this.intersectDebugger) ?? this.visibilityPolygon;  // clone lightSrc so that I can move mouse around while game is paused, without having mousemove events changing lightSrc position
+				// if VL_network is in intermediate state (ex: loaded from debugging session), then VL_network will continue from where intermediate state stopped
+			}catch(err){
+				console.log('error thrown when computing visibility polygon:', err);
+				console.log('emergency game pause');
+				gamePaused = true;
+			}
+		}
+		
+		++frame;
+	},
+
+	render: function(){
+		// clear screen
+		const BACKGROUND_COLOR = "#90B0B0FF";
+		ctx.fillStyle = BACKGROUND_COLOR;
+		ctx.font = "18px courier new";
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		
+		ctx.lineWidth = UNIVERSAL_LINE_WIDTH;
+		
+		if (!mustOverwriteNetwork)
+		{
+				
+			// render visibility polygon border rectangle
+			create_polygon_from_rect(border).render('#000000FF');
+			
+			// render rotating obstacle polygon (triangle)
+			obstaclePolygon.render(1.0);
+		
+			// render wall
+			const WALL_COLOR = '#000000';
+			new LineSeg(wall.r1, wall.r2).render(WALL_COLOR);
+			
+			// render circular shutter
+			for(let i in shutterWalls){
+				shutterWalls[i].render('#000010');
+			}
+			
+			// render visibility polygon
+			const VIS_POLY_STROKE_COLOR = '#11228B0';
+			const VIS_POLY_FILL_COLOR = '#EEDDAAC2';
+			if (this.visibilityPolygon != undefined){
+				this.visibilityPolygon.render(undefined, VIS_POLY_FILL_COLOR);
+			}
+
+			// render bouncing shapes
+			for(let i = 0; i < bouncingShapes.length; ++i){
+				bouncingShapes[i].render('#333333FF');
+			}
+		}
+		else
+		{
+			// render VL_network used in visibility polygon
+			this.visPolyVL_network.render('rgba(0, 0, 0, 255)', 'rgb(60, 30, 40)');
+		}
+		
+		// render active list debugger's edges and vertices at current step
+		this.ALDebugger.render_step(ALDebuggerStepIndex);
+
+		// render lineSeg-lineSeg intersection debugger
+		this.intersectDebugger.render_intersect_result(intersectDebuggerIndex);
+		
+		// render mouse drag box
+		if (dragRect.x != undefined && dragRect.y != undefined && dragRect.w != undefined && dragRect.h != undefined){
+			const DRAG_RECT_LINE_COLOR = '#224499CC';
+			const DRAG_RECT_FILL_COLOR = '#6677DD66';
+			dragRect.render(DRAG_RECT_LINE_COLOR, DRAG_RECT_FILL_COLOR);
+		}
+		
+		// render cursor
+		const CURSOR_COLOR = '#00FFFFFF';
+		lightSrc.render_ring(CURSOR_COLOR, 8);
+		lightSrc.render_ring(CURSOR_COLOR, 2);
+		lightSrc.render_ring(CURSOR_COLOR, 1);
+	},
+	
+	gameLoop: function(){
+		this.update();
+		this.render();
+	},
+
+	run: function(){
+		// execute frame logic and render at a rate of 60 FPS
+		window.setInterval(this.gameLoop.bind(this), 1000/FPS);
+	},
+};
+function startGame(){
+	console.log("program started");
+	game.setup();
+	game.run();
+}
+
+</script>
+</body>
+</html>
