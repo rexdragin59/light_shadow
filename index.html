@@ -2141,7 +2141,7 @@ function caption(str)
 {
 	document.getElementById('debugCaption').innerHTML = `caption ${++captionNum}: ${str.toString()}`;
 }
-caption('hi11');
+caption('line_1');
 
 // level geometry
 let lightSrc = new Vertex(new vec2(1033, 142), [], 'lightSrc');
@@ -2158,6 +2158,7 @@ let shutterWalls = [];
 let currMouseWorldCoords = new vec2(border.x + border.w/2, border.y + border.h/2);
 let bouncingShapes = [];
 const MAX_BOUNCING_SHAPES = 18;
+caption('line_2');
 
 let VL_network_src = '{"lineSegs":[{"r1":0,"r2":1,"debugId":0},{"r1":4,"r2":2,"debugId":3},{"r1":5,"r2":6,"debugId":4},{"r1":6,"r2":7,"debugId":5},{"r1":7,"r2":8,"debugId":6},{"r1":8,"r2":5,"debugId":7},{"r1":9,"r2":10,"debugId":"w_0"},{"r1":11,"r2":12,"debugId":"w_1"},{"r1":13,"r2":14,"debugId":"w_2"},{"r1":15,"r2":16,"debugId":"w_3"},{"r1":17,"r2":18,"debugId":"w_4"},{"r1":19,"r2":20,"debugId":"w_5"},{"r1":21,"r2":22,"debugId":14},{"r1":22,"r2":23,"debugId":15},{"r1":23,"r2":24,"debugId":16},{"r1":21,"r2":"x0","debugId":"x2"},{"r1":2,"r2":"x0","debugId":"x3"},{"r1":3,"r2":"x0","debugId":"x4"},{"r1":24,"r2":"x5","debugId":"x6"},{"r1":"x0","r2":"x5","debugId":"x7"},{"r1":3,"r2":"x5","debugId":"x8"},{"r1":4,"r2":"x5","debugId":"x9"}],"vertices":[{"x":490,"y":431,"debugId":0,"incidentLineSegs":[0]},{"x":450,"y":430,"debugId":1,"incidentLineSegs":[0]},{"x":-10,"y":145,"debugId":4,"incidentLineSegs":[3,"x9"]},{"x":20,"y":60,"debugId":2,"incidentLineSegs":[3,"x3"]},{"x":130,"y":120,"debugId":3,"incidentLineSegs":["x4","x8"]},{"x":null,"y":null,"debugId":5,"incidentLineSegs":[4,7]},{"x":null,"y":null,"debugId":6,"incidentLineSegs":[5,4]},{"x":null,"y":null,"debugId":7,"incidentLineSegs":[6,5]},{"x":null,"y":null,"debugId":8,"incidentLineSegs":[7,6]},{"x":300,"y":360,"debugId":12,"incidentLineSegs":["w_1"]},{"x":570,"y":440,"debugId":23,"incidentLineSegs":[16,15]},{"x":30,"y":440,"debugId":24,"incidentLineSegs":[16,"x6"]},{"x":30,"y":137.85714285714283,"debugId":"x5","incidentLineSegs":["x6","x7","x8","x9"]},{"x":204.73720558371173,"y":305,"debugId":14,"incidentLineSegs":["w_2"]},{"x":30,"y":65.4545454545455,"debugId":"x0","incidentLineSegs":["x2","x3","x4","x7"]},{"x":30,"y":40,"debugId":21,"incidentLineSegs":[14,"x2"]},{"x":190,"y":250,"debugId":15,"incidentLineSegs":["w_3"]},{"x":204.73720558371173,"y":195.00000000000003,"debugId":16,"incidentLineSegs":["w_3"]},{"x":244.99999999999994,"y":154.73720558371178,"debugId":17,"incidentLineSegs":["w_4"]},{"x":300,"y":140,"debugId":18,"incidentLineSegs":["w_4"]},{"x":355,"y":154.73720558371176,"debugId":19,"incidentLineSegs":["w_5"]},{"x":395.2627944162882,"y":194.99999999999994,"debugId":20,"incidentLineSegs":["w_5"]},{"x":570,"y":40,"debugId":22,"incidentLineSegs":[15,14]},{"x":410,"y":250,"debugId":9,"incidentLineSegs":["w_0"]},{"x":395.2627944162883,"y":305,"debugId":10,"incidentLineSegs":["w_0"]},{"x":245.00000000000003,"y":345.2627944162883,"debugId":13,"incidentLineSegs":["w_2"]},{"x":355,"y":345.2627944162882,"debugId":11,"incidentLineSegs":["w_1"]}]}';
 
@@ -2357,6 +2358,7 @@ var game = {
 		}.bind(this));
 		
 		// load resources
+		caption('line_3');
 	},
 	
 	update: function(){
