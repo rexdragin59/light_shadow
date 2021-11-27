@@ -29,7 +29,7 @@
 	<p>drag mouse to zoom into region</p>
 </div>
 <script>
-//throw 'TODO make algorithm more robust so that it doesn\'t crash upon missing any single edge';
+
 const CANVAS_WIDTH = 600;
 const CANVAS_HEIGHT = 480;
 var canvas = undefined;
@@ -41,6 +41,14 @@ var yCanvas = undefined;
 const FPS = 60;
 var frame = 0;
 const UNIVERSAL_LINE_WIDTH = 3;
+
+// caption visible via non-console
+let captionNum = 0;
+function caption(str)
+{
+	document.getElementById('debugCaption').innerHTML = `caption ${++captionNum}: ${str.toString()}`;
+}
+caption('line_0');
 
 // returns an Image(), possibly not yet loaded
 function load_image(filepath){
@@ -2135,12 +2143,6 @@ function rng(seedStr, nArgs = 1)
 	return rNums.map(x => x/RNG_MOD);
 }
 
-// caption visible via non-console
-let captionNum = 0;
-function caption(str)
-{
-	document.getElementById('debugCaption').innerHTML = `caption ${++captionNum}: ${str.toString()}`;
-}
 caption('line_1');
 
 // level geometry
