@@ -6,12 +6,27 @@
 </head>
 <body onload = "startGame()">
 <div>
-	<p style="font-size:30px;">Please move mouse cursor inside canvas area</p>
+	<p style="font-size:30px;">keys: (a, s), (q, w), (p), (u), ( j, k), (n, m), (1, 2, 3, 4, 5, 6, 7, 9, 0), mouseDrag</p>
 	<p id="fps" style="font-size:20px;">fps: </p>
+	<p id="debugCaption" style="font:16px courier new;">DEFAULT_TEXT</p>
 	<p>
 		<canvas id="myCanvas" width="600" height="480" style="border:2 px solid black;"></canvas>
 	</p>
 	<p id="coords">cursor world coords (x, y)</p>
+	<p>press (a,s) to rotate triangle obstacle</p>
+	<p>press (q,w) to decrement/increment ActiveListDebuggerIndex</p>
+	<p>press p to toggle game pause; still allows use of debugger but stops calculating new visibility polygon every frame</p>
+	<p>press u to write every nontrivial intersection result to console</p>
+	<p>press y to log VL_network (after rendering) to console in JSON format</p>
+	<p>press lowercase (j,k) to decrement/increment interesection debugger index</p>
+	<p>press lowercase (J,K) to jump to prev/next nontrivial interesection debugger index</p>
+	<p>press (n,m) to decrement/increment interesection debugger by large number</p>
+	<p>press (1,2,3,4) to scroll camera interesection debugger by large number</p>
+	<p>press (-,=) to zoom camera out/in</p>
+	<p>press 7 to output current cameraRect's position in world coords</p>
+	<p>press 9 to zoom camera into problematic area</p>
+	<p>press 0 to reset camera</p>
+	<p>drag mouse to zoom into region</p>
 </div>
 <script>
 //throw 'TODO make algorithm more robust so that it doesn\'t crash upon missing any single edge';
@@ -2120,6 +2135,14 @@ function rng(seedStr, nArgs = 1)
 	return rNums.map(x => x/RNG_MOD);
 }
 
+// caption visible via non-console
+let captionNum = 0;
+function caption(str)
+{
+	document.getElementById('debugCaption').innerHTML = `caption ${++captionNum}: ${str.toString()}`;
+}
+caption('hi11');
+
 // level geometry
 let lightSrc = new Vertex(new vec2(1033, 142), [], 'lightSrc');
 let border = {x: 30, y: 40, w: CANVAS_WIDTH-60, h: CANVAS_HEIGHT-80};
@@ -2334,7 +2357,6 @@ var game = {
 		}.bind(this));
 		
 		// load resources
-		
 	},
 	
 	update: function(){
@@ -2493,6 +2515,7 @@ var game = {
 			for(let i = 0; i < bouncingShapes.length; ++i){
 				bouncingShapes[i].render('#333333FF');
 			}
+			
 		}
 		else
 		{
@@ -2527,10 +2550,22 @@ var game = {
 
 	run: function(){
 		// execute frame logic and render at a rate of 60 FPS
-		window.setInterval(this.gameLoop.bind(this), 1000/FPS);
+		window.setInterval(function()
+		{
+			try
+			{
+				this.gameLoop();
+			}
+			catch(e)
+			{
+				caption(e.message);
+			}
+		}.bind(this), 1000/FPS);
 	},
 };
-function startGame(){
+
+function startGame()
+{
 	console.log("program started");
 	game.setup();
 	game.run();
