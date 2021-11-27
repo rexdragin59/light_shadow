@@ -365,7 +365,7 @@ LineSeg.prototype.render_saw = function(colorStr = '#000000FF', nPeriods = 10, a
 
 LineSeg.prototype.toString = function()
 {
-	return '( '.concat(this.r1.toString(), ' to ', this.r2.toString(), '; id=', (this.debugId ?? ''), ' )');
+	return '( '.concat(this.r1.toString(), ' to ', this.r2.toString(), '; id=', (this.debugId ? this.debugId : ''), ' )');
 }
 
 
@@ -626,7 +626,7 @@ Vertex.prototype.transfer_incident_edges_to = function(v)
 // since console.log(Vertex) doesn't always display correct values
 Vertex.prototype.toString = function()
 {
-	return '(('.concat(this.x, ', ', this.y, '); id=', (this.debugId ?? ''), ')');
+	return '(('.concat(this.x, ', ', this.y, '); id=', (this.debugId ? this.debugId : ''), ')');
 }
 
 // only renders debugId text; does NOT render vertex itself
@@ -2469,7 +2469,8 @@ var game = {
 			this.intersectDebugger = new IntersectDebugger();
 
 			try{
-				this.visibilityPolygon = get_visibility_polygon(lightSrc, this.visPolyVL_network, border, this.ALDebugger, this.intersectDebugger) ?? this.visibilityPolygon;  // clone lightSrc so that I can move mouse around while game is paused, without having mousemove events changing lightSrc position
+				let visPolygon = get_visibility_polygon(lightSrc, this.visPolyVL_network, border, this.ALDebugger, this.intersectDebugger);
+				this.visibilityPolygon = visPolygon ? visPolygon : this.visibilityPolygon; // clone lightSrc so that I can move mouse around while game is paused, without having mousemove events changing lightSrc position
 				// if VL_network is in intermediate state (ex: loaded from debugging session), then VL_network will continue from where intermediate state stopped
 			}catch(err){
 				console.log('error thrown when computing visibility polygon:', err);
