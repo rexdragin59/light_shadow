@@ -2360,7 +2360,7 @@ var game = {
 		}.bind(this));
 		
 		// load resources
-		caption('line_3');
+		caption('loading...');
 	},
 	
 	update: function(){
@@ -2546,6 +2546,10 @@ var game = {
 		lightSrc.render_ring(CURSOR_COLOR, 8);
 		lightSrc.render_ring(CURSOR_COLOR, 2);
 		lightSrc.render_ring(CURSOR_COLOR, 1);
+		if (frame == 1)
+		{
+			caption('running');
+		}
 	},
 	
 	gameLoop: function(){
