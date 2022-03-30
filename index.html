@@ -1506,7 +1506,7 @@ Vertex_LineSeg_Network.prototype.eliminate_lineSeg_lineSeg_intersections = funct
 			let LsUnchecked = lineSegsUnchecked[i];
 			for(let LsChecked of lineSegsChecked.get_intersection_candidates(LsUnchecked))	// ... test that lineSeg against every checked lineSeg that has a chance of intersecting LsUnchecked
 			{
-				const MAX_ITERATIONS = 999999
+				const MAX_ITERATIONS = 9999999;
 				if (++nLoopIter > MAX_ITERATIONS)
 				{
 					// log all results to figure out what caused the infinite loop
@@ -2167,6 +2167,28 @@ let VL_network_src = '{"lineSegs":[{"r1":0,"r2":1,"debugId":0},{"r1":4,"r2":2,"d
 let mustOverwriteNetwork = false;
 let prevFrameTime = new Date().getTime();
 
+const ENABLE_DRAG = false;
+function handle_mouse_move(xMouse, yMouse)
+{
+	currMouseWorldCoords = new vec2(xMouse, yMouse).camera_to_world_coords(cameraRect);
+	
+	// translate screen mouse coords to camera coords
+	lightSrc = new vec2(xMouse, yMouse).camera_to_world_coords(cameraRect);
+	
+	if (ENABLE_DRAG)
+	{
+		if (mouseDownLoc != undefined)
+		{
+			dragRect.x = Math.min(xMouse,  mouseDownLoc.x);
+			dragRect.y = Math.min(yMouse,  mouseDownLoc.y);
+			dragRect.w = Math.abs(xMouse - mouseDownLoc.x);
+			dragRect.h = Math.abs(yMouse - mouseDownLoc.y);
+		}
+	}
+	
+	update_cursor_world_coords_display(lightSrc.x, lightSrc.y);
+}
+
 var game = {
 	// set canvas and create Context
 	
@@ -2187,20 +2209,7 @@ var game = {
 			xMouse = e.clientX - xCanvas;
 			yMouse = e.clientY - yCanvas;
 			
-			currMouseWorldCoords = new vec2(xMouse, yMouse).camera_to_world_coords(cameraRect);
-			
-			// translate screen mouse coords to camera coords
-			lightSrc = new vec2(xMouse, yMouse).camera_to_world_coords(cameraRect);
-			
-			if (mouseDownLoc != undefined)
-			{
-				dragRect.x = Math.min(xMouse,  mouseDownLoc.x);
-				dragRect.y = Math.min(yMouse,  mouseDownLoc.y);
-				dragRect.w = Math.abs(xMouse - mouseDownLoc.x);
-				dragRect.h = Math.abs(yMouse - mouseDownLoc.y);
-			}
-			
-			update_cursor_world_coords_display(lightSrc.x, lightSrc.y);
+			handle_mouse_move(xMouse, yMouse);
 		}.bind(this));
 		
 		// handle mouse click down
@@ -2209,7 +2218,14 @@ var game = {
 			yMouse = e.clientY - yCanvas;			
 
 			// handle mouse here
-			mouseDownLoc = new vec2(xMouse, yMouse);
+			if (ENABLE_DRAG)
+			{
+				mouseDownLoc = new vec2(xMouse, yMouse);
+			}
+			else
+			{
+				handle_mouse_move(xMouse, yMouse);
+			}
 		}.bind(this));
 		
 		// handle mouse click up
@@ -2217,25 +2233,28 @@ var game = {
 			xMouse = e.clientX - xCanvas;
 			yMouse = e.clientY - yCanvas;
 			
-			const DRAG_MIN_SIZE = 5;
-			if (dragRect.w >= DRAG_MIN_SIZE && dragRect.h >= DRAG_MIN_SIZE)
+			if (ENABLE_DRAG)
 			{
-				// zoom in to mouse drag box
-				let cameraCenter = new vec2(dragRect.x + dragRect.w/2, dragRect.y + dragRect.h/2).camera_to_world_coords(cameraRect);
-				if (dragRect.w/dragRect.h > CANVAS_WIDTH/CANVAS_HEIGHT)
+				const DRAG_MIN_SIZE = 5;
+				if (dragRect.w >= DRAG_MIN_SIZE && dragRect.h >= DRAG_MIN_SIZE)
 				{
-					// width of mouse drag box becomes new camera rect width
-					dstCameraRect.w = dragRect.w/CANVAS_WIDTH*dstCameraRect.w;
-					dstCameraRect.h = dstCameraRect.w/CANVAS_WIDTH*CANVAS_HEIGHT;
-				}
-				else
-				{
-					// height of mouse drag box becomes new camera rect width
-					dstCameraRect.h = dragRect.h/CANVAS_HEIGHT*dstCameraRect.h;
-					dstCameraRect.w = dstCameraRect.h/CANVAS_HEIGHT*CANVAS_WIDTH;
-				}
-				dstCameraRect.x = cameraCenter.x - dstCameraRect.w/2;
-				dstCameraRect.y = cameraCenter.y - dstCameraRect.h/2;
+					// zoom in to mouse drag box
+					let cameraCenter = new vec2(dragRect.x + dragRect.w/2, dragRect.y + dragRect.h/2).camera_to_world_coords(cameraRect);
+					if (dragRect.w/dragRect.h > CANVAS_WIDTH/CANVAS_HEIGHT)
+					{
+						// width of mouse drag box becomes new camera rect width
+						dstCameraRect.w = dragRect.w/CANVAS_WIDTH*dstCameraRect.w;
+						dstCameraRect.h = dstCameraRect.w/CANVAS_WIDTH*CANVAS_HEIGHT;
+					}
+					else
+					{
+						// height of mouse drag box becomes new camera rect width
+						dstCameraRect.h = dragRect.h/CANVAS_HEIGHT*dstCameraRect.h;
+						dstCameraRect.w = dstCameraRect.h/CANVAS_HEIGHT*CANVAS_WIDTH;
+					}
+					dstCameraRect.x = cameraCenter.x - dstCameraRect.w/2;
+					dstCameraRect.y = cameraCenter.y - dstCameraRect.h/2;
+				}	
 			}
 			
 			// handle mouse here
@@ -2250,21 +2269,25 @@ var game = {
 		window.addEventListener('touchstart', function(e){
 			e.preventDefault();	// don't pan/zoom screen
 			// handle touchStart here
-			// let touchStart0 = new vec2(e.touches[0].clientX, e.touches[0].clientY);
+			mouseDownLoc = new vec2(e.touches[0].clientX - xCanvas, e.touches[0].clientY - yCanvas);
+			if (!ENABLE_DRAG)
+			{
+				handle_mouse_move(e.touches[0].clientX - xCanvas, e.touches[0].clientY - yCanvas);
+			}
 		}.bind(this), {passive: false});
 		
 		// handle touch move
 		window.addEventListener('touchmove', function(e){
 			e.preventDefault();	// don't pan/zoom screen
 			// handle touchMove here
-			// let touch0 = new vec2(e.touches[0].clientX, e.touches[0].clientY);
+			handle_mouse_move(e.touches[0].clientX - xCanvas, e.touches[0].clientY - yCanvas);
 		}.bind(this), {passive: false});
 		
-		// handle touch move
+		// handle touch end
 		window.addEventListener('touchend', function(e){
 			e.preventDefault();	// don't pan/zoom screen
 			// handle touchEnd here
-			// e.touches[0].clientX, e.touches[0].clientY;
+			// e.touches[0].clientX - Canvas, e.touches[0].clientY - yCanvas;
 		}.bind(this), {passive: false});
 		
 		const CAMERA_TRANSLATE_SPEED = 129.56;	//  camera pixels per key press
